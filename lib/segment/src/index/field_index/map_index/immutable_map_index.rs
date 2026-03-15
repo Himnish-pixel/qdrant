@@ -4,9 +4,9 @@ use std::iter;
 use std::ops::Range;
 use std::path::PathBuf;
 
-use common::bitvec::BitVec;
+use bitvec::vec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::mmap_hashmap::Key;
+use common::persisted_hashmap::keys::Key;
 use common::types::PointOffsetType;
 use gridstore::Blob;
 
