@@ -7,7 +7,7 @@ use rand::{RngExt, SeedableRng};
 use crate::persisted_hashmap::keys::Key;
 use crate::persisted_hashmap::mmap_hashmap::{MmapHashMap, gen_ident, gen_map, repeat_until};
 use crate::persisted_hashmap::universal_hashmap::UniversalHashMap;
-use crate::universal_io::MmapFile;
+use crate::universal_io::{self, MmapFile};
 
 type UMap<K, V> = UniversalHashMap<K, V, MmapFile>;
 
@@ -23,7 +23,8 @@ where
         + zerocopy::FromBytes
         + zerocopy::Immutable
         + zerocopy::IntoBytes
-        + zerocopy::KnownLayout,
+        + zerocopy::KnownLayout
+        + bytemuck::Pod,
     K1: Ord + Hash,
 {
     let tmpdir = tempfile::Builder::new().tempdir().unwrap();
@@ -37,7 +38,14 @@ where
     (tmpdir, umap)
 }
 
-// ── get / get_with ─────────────────────────────────────────────────────
+/// Collect a `get2` result into `Option<Vec<V>>`, unwrapping all inner results.
+fn collect_get2<V>(
+    result: universal_io::Result<Option<impl Iterator<Item = universal_io::Result<V>>>>,
+) -> Option<Vec<V>> {
+    result.unwrap().map(|it| it.map(|r| r.unwrap()).collect())
+}
+
+// ── get2 ───────────────────────────────────────────────────────────────
 
 fn test_get_impl<K: Key + ?Sized, K1: Ord + Hash>(
     generator: impl Clone + Fn(&mut StdRng) -> K1,
@@ -49,14 +57,14 @@ fn test_get_impl<K: Key + ?Sized, K1: Ord + Hash>(
     let (_tmpdir, umap) = write_and_open(&map, &as_ref);
 
     for (k, v) in &map {
-        let got = umap.get(as_ref(k)).unwrap().unwrap();
+        let got = collect_get2(umap.get(as_ref(k))).unwrap();
         let expected: Vec<u32> = v.iter().copied().collect();
         assert_eq!(got, expected);
     }
 
     for _ in 0..100 {
         let key = repeat_until(|| generator(&mut rng), |key| !map.contains_key(key));
-        assert!(umap.get(as_ref(&key)).unwrap().is_none());
+        assert!(collect_get2(umap.get(as_ref(&key))).is_none());
     }
 }
 
@@ -231,12 +239,12 @@ fn test_u64_values() {
     let (_tmpdir, umap) = write_and_open::<i64, u64, _>(&map, |k| k);
 
     for (k, v) in &map {
-        let got = umap.get(k).unwrap().unwrap();
+        let got = collect_get2(umap.get(k)).unwrap();
         let expected: Vec<u64> = v.iter().copied().collect();
         assert_eq!(got, expected);
     }
 
-    assert!(umap.get(&9999).unwrap().is_none());
+    assert!(collect_get2(umap.get(&9999)).is_none());
 }
 
 #[test]
@@ -257,7 +265,7 @@ fn test_u128_values() {
     let (_tmpdir, umap) = write_and_open::<u128, u128, _>(&map, |k| k);
 
     for (k, v) in &map {
-        let got = umap.get(k).unwrap().unwrap();
+        let got = collect_get2(umap.get(k)).unwrap();
         let expected: Vec<u128> = v.iter().copied().collect();
         assert_eq!(got, expected);
     }
@@ -277,7 +285,7 @@ fn test_single_value_per_key() {
     let (_tmpdir, umap) = write_and_open::<i64, u32, _>(&map, |k| k);
 
     for (k, v) in &map {
-        let got = umap.get(k).unwrap().unwrap();
+        let got = collect_get2(umap.get(k)).unwrap();
         assert_eq!(got, vec![*v.iter().next().unwrap()]);
         assert_eq!(umap.get_values_count(k).unwrap().unwrap(), 1);
     }
@@ -300,7 +308,7 @@ fn test_many_values_per_key() {
     let (_tmpdir, umap) = write_and_open::<i64, u32, _>(&map, |k| k);
 
     for (k, v) in &map {
-        let got = umap.get(k).unwrap().unwrap();
+        let got = collect_get2(umap.get(k)).unwrap();
         let expected: Vec<u32> = v.iter().copied().collect();
         assert_eq!(got, expected);
         assert_eq!(umap.get_values_count(k).unwrap().unwrap(), v.len());
@@ -315,7 +323,7 @@ fn test_empty_map() {
     let (_tmpdir, umap) = write_and_open::<i64, u32, _>(&map, |k| k);
 
     assert_eq!(umap.keys_count(), 0);
-    assert!(umap.get(&0).unwrap().is_none());
+    assert!(collect_get2(umap.get(&0)).is_none());
     assert!(umap.get_values_count(&0).unwrap().is_none());
 
     let mut count = 0;
@@ -342,7 +350,7 @@ fn test_long_string_keys() {
     let (_tmpdir, umap) = write_and_open::<str, u32, _>(&map, |k| k.as_str());
 
     for (k, v) in &map {
-        let got = umap.get(k.as_str()).unwrap().unwrap();
+        let got = collect_get2(umap.get(k.as_str())).unwrap();
         let expected: Vec<u32> = v.iter().copied().collect();
         assert_eq!(got, expected);
     }
@@ -660,7 +668,7 @@ fn test_get_with_batch_missing_values_match_single_get() {
 
     // Verify each result matches individual get().
     for (key, batch_result) in keys.iter().zip(batch_results.iter()) {
-        let single_result = umap.get(key).unwrap();
+        let single_result = collect_get2(umap.get(key));
         assert_eq!(batch_result, &single_result);
     }
 }
