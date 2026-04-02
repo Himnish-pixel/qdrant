@@ -502,13 +502,19 @@ impl<
     fn batch_resolve_bucket_offsets(&self, bucket_ids: Vec<u64>) -> io::Result<Vec<u64>> {
         let mut entry_offsets: Vec<u64> = vec![0; bucket_ids.len()];
 
-        let ranges = bucket_ids.into_iter().map(|bucket_idx| ReadRange {
-            byte_offset: self.header.buckets_pos + bucket_idx * size_of::<BucketOffset>() as u64,
-            length: size_of::<BucketOffset>() as u64,
+        let ranges = bucket_ids.into_iter().enumerate().map(|(idx, bucket_idx)| {
+            (
+                idx,
+                ReadRange {
+                    byte_offset: self.header.buckets_pos
+                        + bucket_idx * size_of::<BucketOffset>() as u64,
+                    length: size_of::<BucketOffset>() as u64,
+                },
+            )
         });
 
         self.reader
-            .read_batch::<Random>(ranges, |idx, data| {
+            .read_batch::<Random, _>(ranges, |idx, data| {
                 let (offset, _) = BucketOffset::read_from_prefix(data)
                     .map_err(|e| uio_data_err(e.to_string()))?;
                 entry_offsets[idx] = offset;
@@ -534,14 +540,17 @@ impl<
             let key = keys[idx_mapping[idx]];
             let header_size =
                 Self::key_size_with_padding(key) + Self::values_len_size_with_padding();
-            ReadRange {
-                byte_offset: self.entries_start + *entry_offset,
-                length: header_size as u64,
-            }
+            (
+                idx,
+                ReadRange {
+                    byte_offset: self.entries_start + *entry_offset,
+                    length: header_size as u64,
+                },
+            )
         });
 
         self.reader
-            .read_batch::<Random>(ranges, |idx, data| {
+            .read_batch::<Random, _>(ranges, |idx, data| {
                 let key_id = idx_mapping[idx];
                 let key = keys[key_id];
                 let header_size =
@@ -594,17 +603,22 @@ impl<
             return Ok(results);
         }
 
-        let ranges =
-            values_offsets
-                .into_iter()
-                .zip(values_lens)
-                .map(|(values_offset, values_len)| ReadRange {
-                    byte_offset: values_offset,
-                    length: u64::from(values_len) * Self::VALUE_SIZE as u64,
-                });
+        let ranges = values_offsets
+            .into_iter()
+            .zip(values_lens)
+            .enumerate()
+            .map(|(idx, (values_offset, values_len))| {
+                (
+                    idx,
+                    ReadRange {
+                        byte_offset: values_offset,
+                        length: u64::from(values_len) * Self::VALUE_SIZE as u64,
+                    },
+                )
+            });
 
         self.reader
-            .read_batch::<Sequential>(ranges, |idx, data| {
+            .read_batch::<Sequential, _>(ranges, |idx, data| {
                 let key_id = idx_mapping[idx];
                 let key = keys[key_id];
                 Self::with_values(data, |values| {
