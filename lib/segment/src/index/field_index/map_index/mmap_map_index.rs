@@ -13,6 +13,7 @@ use common::fs::{atomic_save_json, clear_disk_cache, read_json};
 use common::mmap::create_and_ensure_length;
 use common::persisted_hashmap::keys::Key;
 use common::persisted_hashmap::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::universal_hashmap::UniversalHashMap;
 use common::stored_bitslice::MmapBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFile, OpenOptions};
@@ -51,6 +52,7 @@ pub struct MmapMapIndex<N: MapIndexKey + Key + ?Sized> {
 
 pub(super) struct Storage<N: MapIndexKey + Key + ?Sized> {
     value_to_points: MmapHashMap<N, PointOffsetType>,
+    pub(super) value_to_points2: UniversalHashMap<N, PointOffsetType, MmapFile>,
     point_to_values: StoredPointToValues<N, MmapFile>,
     /// In-memory deletion bitmap. Reconstructed at load time as the union of
     /// the build-time empty-payload bits read from `deleted.bin` and the
@@ -62,6 +64,7 @@ impl<N: MapIndexKey + Key + ?Sized> Storage<N> {
     pub(crate) fn ram_usage_bytes(&self) -> usize {
         let Self {
             value_to_points: _,
+            value_to_points2: _,
             point_to_values,
             deleted,
         } = self;
@@ -118,6 +121,14 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             path: path.to_path_buf(),
             storage: Storage {
                 value_to_points: hashmap,
+                value_to_points2: UniversalHashMap::open(
+                    &hashmap_path,
+                    // TODO: move options somewhere
+                    OpenOptions {
+                        populate: Some(do_populate),
+                        ..OpenOptions::default()
+                    },
+                )?,
                 point_to_values,
                 deleted,
             },
@@ -327,7 +338,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     }
 
     pub fn get_unique_values_count(&self) -> usize {
-        self.storage.value_to_points.keys_count()
+        self.storage.value_to_points2.keys_count()
     }
 
     pub fn get_count_for_value(
@@ -343,8 +354,8 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             .payload_index_io_read_counter()
             .incr_delta(READ_ENTRY_OVERHEAD);
 
-        match self.storage.value_to_points.get(value) {
-            Ok(Some(points)) => Some(points.len()),
+        match self.storage.value_to_points2.get_values_count(value) {
+            Ok(Some(count)) => Some(count),
             Ok(None) => None,
             Err(err) => {
                 debug_assert!(
@@ -469,7 +480,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     /// Populate all pages in the mmap.
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
-        self.storage.value_to_points.populate()?;
+        self.storage.value_to_points2.populate()?;
         self.storage.point_to_values.populate()?;
         Ok(())
     }
@@ -485,10 +496,12 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         } = self;
         let Storage {
             value_to_points,
+            value_to_points2,
             point_to_values,
             deleted: _,
         } = storage;
         value_to_points.clear_cache()?;
+        value_to_points2.clear_ram_cache()?;
         clear_disk_cache(&path.join(DELETED_PATH))?;
         point_to_values.clear_cache()?;
         Ok(())
