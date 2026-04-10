@@ -152,7 +152,10 @@ impl<
         Self::with_values(&values_bytes, f).map(Some)
     }
 
-    pub fn get(&self, key: &K) -> Result<Option<impl Iterator<Item = Result<V>>>> {
+    pub fn get<'a>(
+        &'a self,
+        key: &K,
+    ) -> Result<Option<impl Iterator<Item = Result<V>> + use<'a, K, V, R>>> {
         let Some((entry_start, header_size, values_len)) = self.lookup_entry_header(key)? else {
             return Ok(None);
         };
