@@ -126,6 +126,12 @@ impl<
         self.header.buckets_count as usize
     }
 
+    pub fn keys(&self) -> Result<()> {
+        // let buckets = self.read_all_bucket_offsets()?;
+
+        Ok(())
+    }
+
     // ── Single-key lookup ───────────────────────────────────────────────
 
     /// Look up the values associated with `key`, passing them to `f`.
