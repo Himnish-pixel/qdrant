@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Cursor};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -372,6 +373,24 @@ impl<
         Ok(())
     }
 
+    // ── Borrowed iteration ──────────────────────────────────────────────
+
+    /// Iterate over all entries, returning owned `(key, values)` pairs.
+    ///
+    /// Reads the entire entries region at once. Works with both borrowed
+    /// (mmap) and owned (io_uring, etc.) storage backends.
+    pub fn iter(&self) -> Result<impl Iterator<Item = (<K as ToOwned>::Owned, Vec<V>)>>
+    where
+        K: ToOwned,
+    {
+        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
+        let data = self.read_entries_region()?;
+        Ok(offsets.into_iter().filter_map(move |off| {
+            let (key, values) = Self::parse_entry_ref(data.get(off as usize..)?)?;
+            Some((key.to_owned(), values.to_vec()))
+        }))
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Populate the RAM cache for the backing file.
@@ -434,6 +453,24 @@ impl<
         let (offset, _) = BucketOffset::read_from_prefix(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Can't read bucket offset"))?;
         Ok(offset)
+    }
+
+    fn read_entries_region(&self) -> Result<Cow<'_, [u8]>> {
+        let len = UniversalRead::<u8>::len(&self.reader)? - self.entries_start;
+        self.reader.read::<Sequential>(ReadRange {
+            byte_offset: self.entries_start,
+            length: len,
+        })
+    }
+
+    fn parse_entry_ref<'a>(entry: &'a [u8]) -> Option<(&'a K, &'a [V])> {
+        let key = K::from_bytes(entry)?;
+        let kp = Self::key_size_with_padding(key);
+        let (vl, _) = ValuesLen::read_from_prefix(entry.get(kp..)?).ok()?;
+        let vf = kp + Self::values_len_size_with_padding();
+        let vt = vf + vl as usize * Self::VALUE_SIZE;
+        let values = <[V]>::ref_from_bytes(entry.get(vf..vt)?).ok()?;
+        Some((key, values))
     }
 
     fn key_size_with_padding(key: &K) -> usize {

@@ -414,7 +414,12 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         deferred_internal_id: Option<PointOffsetType>,
         mut f: impl FnMut(&N, usize) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        self.storage.value_to_points.iter().try_for_each(|(k, v)| {
+        let result = self.storage.value_to_points2.iter();
+        if let Err(err) = &result {
+            debug_assert!(false, "Error while iterating value_to_points: {err:?}");
+            log::error!("Error while iterating value_to_points: {err:?}");
+        }
+        result.into_iter().flatten().try_for_each(|(k, v)| {
             let count = v
                 .iter()
                 .filter(|&&idx| {
@@ -426,37 +431,39 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
                 })
                 .unique()
                 .count();
-            f(k, count)
+            f(k.borrow(), count)
         })
     }
 
-    pub fn for_each_value_map<'a>(
-        &'a self,
-        hw_counter: &'a HardwareCounterCell,
-        mut f: impl FnMut(&'a N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()> + 'a,
+    pub fn for_each_value_map(
+        &self,
+        hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(&N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
     ) -> OperationResult<()> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
+        let deleted = &self.storage.deleted;
 
-        self.storage
-            .value_to_points
-            .iter()
-            .try_for_each(move |(k, v)| {
-                hw_counter
-                    .payload_index_io_read_counter()
-                    .incr_delta(k.write_bytes());
+        let result = self.storage.value_to_points2.iter();
+        if let Err(err) = &result {
+            debug_assert!(false, "Error while iterating value_to_points: {err:?}");
+            log::error!("Error while iterating value_to_points: {err:?}");
+        }
+        result.into_iter().flatten().try_for_each(move |(k, v)| {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(k.borrow().write_bytes());
 
-                let mut iter = v
-                    .iter()
-                    .copied()
-                    .filter(|idx| !self.storage.deleted.get_bit(*idx as usize).unwrap_or(true))
-                    .measure_hw_with_acc(
-                        hw_counter.new_accumulator(),
-                        size_of::<PointOffsetType>(),
-                        |i| i.payload_index_io_read_counter(),
-                    );
+            let mut iter = v
+                .into_iter()
+                .filter(|idx| !deleted.get_bit(*idx as usize).unwrap_or(true))
+                .measure_hw_with_acc(
+                    hw_counter.new_accumulator(),
+                    size_of::<PointOffsetType>(),
+                    |i| i.payload_index_io_read_counter(),
+                );
 
-                f(k, &mut iter)
-            })
+            f(k.borrow(), &mut iter)
+        })
     }
 
     fn make_conditioned_counter<'a>(
