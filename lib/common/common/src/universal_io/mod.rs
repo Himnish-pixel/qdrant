@@ -6,6 +6,7 @@ pub mod file_ops;
 pub mod io_uring;
 pub mod local_file_ops;
 pub mod mmap;
+pub mod on_demand;
 pub mod read;
 pub mod wrappers;
 pub mod write;
@@ -20,6 +21,7 @@ pub use self::file_ops::UniversalReadFileOps;
 pub use self::io_uring::*;
 pub use self::mmap::*;
 pub use self::read::*;
+pub use self::on_demand::*;
 pub use self::wrappers::*;
 pub use self::write::UniversalWrite;
 use crate::mmap::{Advice, AdviceSetting};
@@ -29,6 +31,7 @@ pub enum UniversalKind {
     Mmap,
     IoUring,
     DiskCache,
+    OnDemand,
 }
 
 #[derive(Copy, Clone, Debug)]

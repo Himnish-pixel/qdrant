@@ -1443,6 +1443,7 @@ dependencies = [
  "procfs",
  "quick_cache",
  "rand 0.10.1",
+ "roaring",
  "rstest",
  "schemars 0.8.22",
  "self_cell",
