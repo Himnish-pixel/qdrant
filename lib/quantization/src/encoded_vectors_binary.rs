@@ -804,8 +804,8 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         }
     }
 
-    pub fn get_quantized_vector(&self, i: PointOffsetType) -> Cow<'_, [u8]> {
-        self.encoded_vectors.get_vector_data(i as _)
+    pub fn get_quantized_vector(&self, offset: PointOffsetType) -> Cow<'_, [u8]> {
+        self.encoded_vectors.get_vector_data(offset)
     }
 
     pub fn layout(&self) -> Layout {

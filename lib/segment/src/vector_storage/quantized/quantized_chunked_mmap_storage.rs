@@ -6,6 +6,7 @@ use common::generic_consts::Random;
 use common::mmap::{Advice, AdviceSetting, MmapFlusher};
 use common::types::PointOffsetType;
 use common::universal_io::MmapFile;
+use quantization::encoded_storage::UniversalOffset;
 
 use crate::common::operation_error::OperationResult;
 use crate::vector_storage::VectorOffsetType;
@@ -42,9 +43,9 @@ impl QuantizedChunkedMmapStorage {
 }
 
 impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
+    fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
         self.data
-            .get::<Random>(index as VectorOffsetType)
+            .get_many::<Random>(offset.start() as _, offset.count() as _)
             .unwrap_or_default()
     }
 

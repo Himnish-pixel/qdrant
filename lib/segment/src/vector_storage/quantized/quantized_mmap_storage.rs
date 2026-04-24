@@ -8,6 +8,7 @@ use common::types::PointOffsetType;
 use fs_err as fs;
 use fs_err::OpenOptions;
 use memmap2::{Mmap, MmapMut};
+use quantization::encoded_storage::UniversalOffset;
 
 #[derive(Debug)]
 pub struct QuantizedMmapStorage {
@@ -72,9 +73,9 @@ impl QuantizedMmapStorage {
 }
 
 impl quantization::EncodedStorage for QuantizedMmapStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
-        let start = self.quantized_vector_size.get() * index as usize;
-        let end = self.quantized_vector_size.get() * (index + 1) as usize;
+    fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        let start = self.quantized_vector_size.get() * offset.start() as usize;
+        let end = self.quantized_vector_size.get() * (offset.start() + offset.count()) as usize;
         Cow::Borrowed(self.mmap.get(start..end).unwrap_or(&[]))
     }
 

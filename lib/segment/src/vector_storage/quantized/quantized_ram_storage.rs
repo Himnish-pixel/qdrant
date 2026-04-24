@@ -8,10 +8,10 @@ use common::mmap::MmapFlusher;
 use common::types::PointOffsetType;
 use fs_err as fs;
 use fs_err::File;
+use quantization::encoded_storage::UniversalOffset;
 
 use crate::common::operation_error::OperationResult;
 use crate::common::vector_utils::TrySetCapacityExact;
-use crate::vector_storage::VectorOffsetType;
 use crate::vector_storage::volatile_chunked_vectors::VolatileChunkedVectors;
 
 #[derive(Debug)]
@@ -44,8 +44,13 @@ impl QuantizedRamStorage {
 }
 
 impl quantization::EncodedStorage for QuantizedRamStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
-        Cow::Borrowed(self.vectors.get(index as VectorOffsetType))
+    fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        let vectors = self
+            .vectors
+            .get_many(offset.start() as _, offset.count() as _)
+            .unwrap_or_default();
+
+        Cow::Borrowed(vectors)
     }
 
     fn upsert_vector(

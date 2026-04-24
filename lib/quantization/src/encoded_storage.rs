@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::fmt;
 #[cfg(feature = "testing")]
 use std::io::{Read, Write};
 #[cfg(feature = "testing")]
@@ -18,7 +19,7 @@ use fs_err as fs;
 use fs_err::File;
 
 pub trait EncodedStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]>;
+    fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]>;
 
     fn is_on_disk(&self) -> bool;
 
@@ -48,6 +49,33 @@ pub trait EncodedStorageBuilder {
     fn build(self) -> std::io::Result<Self::Storage>;
 
     fn push_vector_data(&mut self, other: &[u8]) -> std::io::Result<()>;
+}
+
+pub trait UniversalOffset: Copy + fmt::Debug {
+    fn start(self) -> PointOffsetType;
+    fn count(self) -> u32;
+}
+
+impl UniversalOffset for PointOffsetType {
+    fn start(self) -> PointOffsetType {
+        self
+    }
+
+    fn count(self) -> u32 {
+        1
+    }
+}
+
+impl UniversalOffset for (PointOffsetType, u32) {
+    fn start(self) -> PointOffsetType {
+        let (offset, _) = self;
+        offset
+    }
+
+    fn count(self) -> u32 {
+        let (_, count) = self;
+        count
+    }
 }
 
 #[cfg(feature = "testing")]
@@ -90,15 +118,15 @@ impl TestEncodedStorage {
 
 #[cfg(feature = "testing")]
 impl EncodedStorage for TestEncodedStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
+    fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
         let start = self
             .quantized_vector_size
             .get()
-            .saturating_mul(index as usize);
+            .saturating_mul(offset.start() as _);
         let end = self
             .quantized_vector_size
             .get()
-            .saturating_mul(index as usize + 1);
+            .saturating_mul((offset.start() + offset.count()) as _);
 
         Cow::Borrowed(self.data.get(start..end).unwrap_or(&[]))
     }
