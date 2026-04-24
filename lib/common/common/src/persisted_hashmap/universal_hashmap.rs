@@ -126,8 +126,106 @@ impl<
         self.header.buckets_count as usize
     }
 
-    pub fn keys(&self) -> Result<()> {
-        // let buckets = self.read_all_bucket_offsets()?;
+    pub fn for_each_key(&self, mut f: impl FnMut(&K) -> Result<()>) -> Result<()> {
+        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
+        self.for_each_impl(PartialEntryKind::KeyOnly, offsets.into_iter(), |entry| {
+            let PartialEntry::KeyOnly(key) = entry else {
+                unreachable!()
+            };
+            f(key)
+        })
+    }
+
+    pub fn for_each_key_and_len(&self, mut f: impl FnMut(&K, usize) -> Result<()>) -> Result<()> {
+        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
+        self.for_each_impl(PartialEntryKind::KeyAndLen, offsets.into_iter(), |entry| {
+            let PartialEntry::KeyAndLen(key, values_len) = entry else {
+                unreachable!()
+            };
+            f(key, values_len as usize)
+        })
+    }
+
+    // TODO: drop for_each_entry
+    pub fn for_each_entry_v2(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
+        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
+        self.for_each_impl(
+            PartialEntryKind::KeyAndValues(32), // TODO
+            offsets.into_iter(),
+            |entry| {
+                let PartialEntry::KeyAndValues(key, values) = entry else {
+                    unreachable!()
+                };
+                f(key, values)
+            },
+        )
+    }
+
+    fn for_each_impl(
+        &self,
+        entry_kind: PartialEntryKind,
+        offsets: impl Iterator<Item = u64>,
+        mut f: impl FnMut(PartialEntry<'_, K, V>) -> Result<()>,
+    ) -> Result<()> {
+        let expected_read_size = entry_kind.est_size::<K, V>() as u64;
+
+        let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
+
+        let reads = offsets.into_iter().map(|offset| {
+            let byte_offset = self.entries_start + offset;
+            let range = ReadRange {
+                byte_offset,
+                length: file_len.min(expected_read_size),
+            };
+            (byte_offset, range.clamp::<u8>(file_len))
+        });
+
+        struct ExtraRead {
+            data_vec: Vec<u8>,
+            byte_offset: u64,
+            expected_len: u64,
+        }
+        let mut next_extra_reads = Vec::new();
+        self.reader
+            .read_batch::<Random, _>(reads, |byte_offset, data| {
+                match entry_kind.try_read::<K, V>(data) {
+                    Ok(entry) => f(entry),
+                    Err(expected_len) => {
+                        let mut data_vec = Vec::with_capacity(expected_len as usize);
+                        data_vec.extend_from_slice(data);
+                        next_extra_reads.push(ExtraRead {
+                            data_vec,
+                            byte_offset,
+                            expected_len,
+                        });
+                        Ok(())
+                    }
+                }
+            })?;
+
+        while !next_extra_reads.is_empty() {
+            let extra_reads = std::mem::take(&mut next_extra_reads)
+                .into_iter()
+                .map(|extra| {
+                    let range = ReadRange {
+                        byte_offset: extra.byte_offset + extra.data_vec.len() as u64,
+                        length: file_len.min(extra.expected_len - extra.data_vec.len() as u64),
+                    };
+                    (extra, range.clamp::<u8>(file_len))
+                });
+            self.reader
+                .read_batch::<Random, _>(extra_reads, |mut extra, data| {
+                    extra.data_vec.extend_from_slice(data);
+                    match entry_kind.try_read::<K, V>(&extra.data_vec) {
+                        Ok(entry) => f(entry),
+                        Err(expected_len) => {
+                            extra.expected_len = expected_len;
+                            next_extra_reads.push(extra);
+                            Ok(())
+                        }
+                    }
+                })?;
+        }
 
         Ok(())
     }
@@ -289,91 +387,6 @@ impl<
 
                 Self::with_values(values_bytes, |values| f(key, values))?;
             }
-        }
-
-        Ok(())
-    }
-
-    /// Iterate over all keys without reading the values.
-    ///
-    /// Reads bucket offsets in one bulk IO, then uses `read_batch` to fetch only the
-    /// key-header portion of each entry (sorted by file offset for sequential access).
-    /// Values data is never touched.
-    ///
-    /// For variable-length keys (e.g. `str`) a capped initial read is used; entries
-    /// whose keys are longer than the cap are retried with the full entry size.
-    pub fn for_each_key(&self, mut f: impl FnMut(&K)) -> Result<()> {
-        let bucket_count = self.header.buckets_count as usize;
-        if bucket_count == 0 {
-            return Ok(());
-        }
-
-        // 1. Read all bucket offsets at once.
-        let buckets = self.read_all_bucket_offsets()?;
-
-        // Sort offsets by file position for sequential IO.
-        let file_len = UniversalRead::<u8>::len(&self.reader)?;
-        let entries_region_len = file_len - self.entries_start;
-
-        let sorted_offsets = buckets.to_sorted_vec();
-
-        // 2. Build capped read ranges — read just enough for the key header.
-        //
-        // For fixed-size keys the cap is exact. For variable-length keys (str) we
-        // use KEY_READ_CAP bytes; any entry whose key is longer will be retried.
-        const KEY_READ_CAP: u64 = 512;
-
-        let key_size = K::fixed_size().unwrap_or(KEY_READ_CAP);
-
-        let ranges = sorted_offsets.iter().enumerate().map(|(i, &offset)| {
-            let next_entry = sorted_offsets
-                .get(i + 1)
-                .copied()
-                .unwrap_or(entries_region_len);
-            let available = next_entry - offset;
-            let range = ReadRange {
-                byte_offset: self.entries_start + offset,
-                length: available.min(key_size),
-            };
-            (i, range)
-        });
-
-        // 3. Batch-read the key headers (sequential order).
-        let mut retry_indices: Vec<usize> = Vec::new();
-
-        self.reader.read_batch::<Random, _>(ranges, |idx, data| {
-            match K::from_bytes(data) {
-                Some(key) => f(key),
-                None => retry_indices.push(idx),
-            }
-            Ok(())
-        })?;
-
-        // 4. Retry any truncated keys with the full entry size.
-        if !retry_indices.is_empty() {
-            let retry_ranges = retry_indices.iter().map(|&idx| {
-                let offset = sorted_offsets[idx];
-                let next_entry = sorted_offsets
-                    .get(idx + 1)
-                    .copied()
-                    .unwrap_or(entries_region_len);
-                let range = ReadRange {
-                    byte_offset: self.entries_start + offset,
-                    length: next_entry - offset,
-                };
-                ((), range)
-            });
-
-            self.reader
-                .read_batch::<Random, ()>(retry_ranges, |(), data| {
-                    if let Some(key) = K::from_bytes(data) {
-                        f(key);
-                    } else {
-                        debug_assert!(false, "Failed to read key even with full entry size");
-                        log::error!("Failed to read key even with full entry size");
-                    }
-                    Ok(())
-                })?;
         }
 
         Ok(())
@@ -543,13 +556,12 @@ impl<
             )
         });
 
-        self.reader
-            .read_batch::<Random, _>(ranges, |idx, data| {
-                let (offset, _) = BucketOffset::read_from_prefix(data)
-                    .map_err(|e| uio_data_err(e.to_string()))?;
-                entry_offsets[idx] = offset;
-                Ok(())
-            })?;
+        self.reader.read_batch::<Random, _>(ranges, |idx, data| {
+            let (offset, _) =
+                BucketOffset::read_from_prefix(data).map_err(|e| uio_data_err(e.to_string()))?;
+            entry_offsets[idx] = offset;
+            Ok(())
+        })?;
 
         Ok(entry_offsets)
     }
@@ -578,31 +590,30 @@ impl<
             )
         });
 
-        self.reader
-            .read_batch::<Random, _>(ranges, |idx, data| {
-                let key_id = idx_mapping[idx];
-                let key = keys[key_id];
-                let header_size =
-                    Self::key_size_with_padding(key) + Self::values_len_size_with_padding();
-                let entry_offset = entry_offsets[idx];
+        self.reader.read_batch::<Random, _>(ranges, |idx, data| {
+            let key_id = idx_mapping[idx];
+            let key = keys[key_id];
+            let header_size =
+                Self::key_size_with_padding(key) + Self::values_len_size_with_padding();
+            let entry_offset = entry_offsets[idx];
 
-                if !key.matches(data) {
-                    return Ok(());
-                }
-                let key_pad = Self::key_size_with_padding(key);
-                let vl_bytes = data
-                    .get(key_pad..)
-                    .ok_or_else(|| uio_data_err("Entry too short for values_len"))?;
-                let (vl, _) = ValuesLen::read_from_prefix(vl_bytes)
-                    .map_err(|e| uio_data_err(e.to_string()))?;
+            if !key.matches(data) {
+                return Ok(());
+            }
+            let key_pad = Self::key_size_with_padding(key);
+            let vl_bytes = data
+                .get(key_pad..)
+                .ok_or_else(|| uio_data_err("Entry too short for values_len"))?;
+            let (vl, _) =
+                ValuesLen::read_from_prefix(vl_bytes).map_err(|e| uio_data_err(e.to_string()))?;
 
-                let values_offset = self.entries_start + entry_offset + header_size as u64;
+            let values_offset = self.entries_start + entry_offset + header_size as u64;
 
-                values_offsets.push(values_offset);
-                values_lens.push(vl);
-                new_idx_mapping.push(key_id);
-                Ok(())
-            })?;
+            values_offsets.push(values_offset);
+            values_lens.push(vl);
+            new_idx_mapping.push(key_id);
+            Ok(())
+        })?;
 
         Ok((new_idx_mapping, values_offsets, values_lens))
     }
@@ -655,4 +666,68 @@ impl<
 
 fn uio_data_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> UniversalIoError {
     UniversalIoError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
+}
+
+#[derive(Copy, Clone)]
+enum PartialEntryKind {
+    KeyOnly,
+    KeyAndLen,
+    KeyAndValues(u32),
+}
+
+impl PartialEntryKind {
+    fn est_size<K: Key + ?Sized, V>(self) -> usize {
+        match self {
+            Self::KeyOnly => K::VALUE_SIZE_EST,
+            Self::KeyAndLen => K::VALUE_SIZE_EST + size_of::<ValuesLen>(),
+            Self::KeyAndValues(values_len) => {
+                K::VALUE_SIZE_EST + size_of::<ValuesLen>() + size_of::<V>() * (values_len as usize)
+            }
+        }
+    }
+
+    fn try_read<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>(
+        self,
+        data: &[u8],
+    ) -> Result<PartialEntry<'_, K, V>, u64> {
+        let Some(key) = K::from_bytes(data) else {
+            return Err(data.len().next_power_of_two() as u64);
+        };
+        if matches!(self, Self::KeyOnly) {
+            return Ok(PartialEntry::KeyOnly(key));
+        }
+
+        let key_size = key.write_bytes();
+        let values_len_start = key_size.next_multiple_of(size_of::<ValuesLen>());
+        let values_len_end = values_len_start + size_of::<ValuesLen>();
+
+        if data.len() < values_len_end {
+            return Err(values_len_end as u64);
+        }
+
+        let values_len =
+            ValuesLen::from_le_bytes(data[values_len_start..values_len_end].try_into().unwrap());
+
+        if matches!(self, Self::KeyAndLen) {
+            return Ok(PartialEntry::KeyAndLen(key, values_len));
+        }
+
+        let values_start = values_len_end.next_multiple_of(size_of::<V>());
+        let values_end = values_start + values_len as usize * size_of::<V>();
+
+        if data.len() < values_end {
+            return Err(values_end as u64);
+        }
+
+        return Ok(PartialEntry::KeyAndValues(
+            key,
+            <[V]>::ref_from_bytes(&data[values_start..values_end]).unwrap(),
+        ));
+    }
+}
+
+enum PartialEntry<'a, K: Key + ?Sized, V> {
+    KeyOnly(&'a K),
+    KeyAndLen(&'a K, u32),
+    KeyAndValues(&'a K, &'a [V]),
 }

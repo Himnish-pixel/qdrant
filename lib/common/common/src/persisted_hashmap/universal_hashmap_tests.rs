@@ -186,6 +186,7 @@ fn test_for_each_key_impl<K: Key + ?Sized, K1: Ord + Hash + Clone + std::fmt::De
     let mut keys: BTreeSet<K1> = BTreeSet::new();
     umap.for_each_key(|k| {
         keys.insert(from_ref(k));
+        Ok(())
     })
     .unwrap();
 
@@ -330,7 +331,11 @@ fn test_empty_map() {
     umap.for_each_entry(|_, _| count += 1).unwrap();
     assert_eq!(count, 0);
 
-    umap.for_each_key(|_: &i64| count += 1).unwrap();
+    umap.for_each_key(|_: &i64| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(count, 0);
 }
 
@@ -356,7 +361,11 @@ fn test_long_string_keys() {
     }
 
     let mut key_count = 0;
-    umap.for_each_key(|_| key_count += 1).unwrap();
+    umap.for_each_key(|_| {
+        key_count += 1;
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(key_count, map.len());
 
     let mut entry_count = 0;

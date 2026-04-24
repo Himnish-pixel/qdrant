@@ -10,6 +10,9 @@ pub trait Key: Sync + Hash {
 
     const NAME: [u8; 8];
 
+    /// Reasonable guess size of the key when performing random read
+    const VALUE_SIZE_EST: usize;
+
     /// Returns number of bytes which `write` will write.
     fn write_bytes(&self) -> usize;
 
@@ -27,6 +30,8 @@ pub trait Key: Sync + Hash {
 
 impl Key for str {
     const ALIGN: usize = align_of::<u8>();
+
+    const VALUE_SIZE_EST: usize = 512; // A guess.
 
     const NAME: [u8; 8] = *b"str\0\0\0\0\0";
 
@@ -83,10 +88,12 @@ impl Key for str {
 impl Key for i64 {
     const ALIGN: usize = align_of::<i64>();
 
+    const VALUE_SIZE_EST: usize = size_of::<i64>();
+
     const NAME: [u8; 8] = *b"i64\0\0\0\0\0";
 
     fn write_bytes(&self) -> usize {
-        size_of::<i64>()
+        Self::VALUE_SIZE_EST
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -109,10 +116,12 @@ impl Key for i64 {
 impl Key for u128 {
     const ALIGN: usize = size_of::<u128>();
 
+    const VALUE_SIZE_EST: usize = size_of::<u128>();
+
     const NAME: [u8; 8] = *b"u128\0\0\0\0";
 
     fn write_bytes(&self) -> usize {
-        size_of::<u128>()
+        Self::VALUE_SIZE_EST
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {

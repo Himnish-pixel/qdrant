@@ -51,8 +51,7 @@ pub struct MmapMapIndex<N: MapIndexKey + Key + ?Sized> {
 }
 
 pub(super) struct Storage<N: MapIndexKey + Key + ?Sized> {
-    value_to_points: MmapHashMap<N, PointOffsetType>,
-    pub(super) value_to_points2: UniversalHashMap<N, PointOffsetType, MmapFile>,
+    pub(super) value_to_points: UniversalHashMap<N, PointOffsetType, MmapFile>,
     point_to_values: StoredPointToValues<N, MmapFile>,
     /// In-memory deletion bitmap. Reconstructed at load time as the union of
     /// the build-time empty-payload bits read from `deleted.bin` and the
@@ -64,7 +63,6 @@ impl<N: MapIndexKey + Key + ?Sized> Storage<N> {
     pub(crate) fn ram_usage_bytes(&self) -> usize {
         let Self {
             value_to_points: _,
-            value_to_points2: _,
             point_to_values,
             deleted,
         } = self;
@@ -99,7 +97,6 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
 
         let do_populate = !is_on_disk;
 
-        let hashmap = MmapHashMap::open(&hashmap_path, do_populate)?;
         let point_to_values = StoredPointToValues::open(path, do_populate)?;
 
         let mut deleted = deleted_points.to_owned();
@@ -120,8 +117,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         Ok(Some(Self {
             path: path.to_path_buf(),
             storage: Storage {
-                value_to_points: hashmap,
-                value_to_points2: UniversalHashMap::open(
+                value_to_points: UniversalHashMap::open(
                     &hashmap_path,
                     // TODO: move options somewhere
                     OpenOptions {
@@ -338,7 +334,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     }
 
     pub fn get_unique_values_count(&self) -> usize {
-        self.storage.value_to_points2.keys_count()
+        self.storage.value_to_points.keys_count()
     }
 
     pub fn get_count_for_value(
@@ -354,7 +350,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             .payload_index_io_read_counter()
             .incr_delta(READ_ENTRY_OVERHEAD);
 
-        match self.storage.value_to_points2.get_values_count(value) {
+        match self.storage.value_to_points.get_values_count(value) {
             Ok(Some(count)) => Some(count),
             Ok(None) => None,
             Err(err) => {
@@ -371,7 +367,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     pub fn get_iterator(&self, value: &N, hw_counter: &HardwareCounterCell) -> IdIter<'_> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
 
-        match self.storage.value_to_points2.get(value) {
+        match self.storage.value_to_points.get(value) {
             Ok(Some(iter)) => {
                 // We're iterating over the whole (mmapped) slice
                 hw_counter
@@ -406,7 +402,11 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         &self,
         mut f: impl FnMut(&N) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        self.storage.value_to_points.keys().try_for_each(&mut f)
+        Ok(self.storage.value_to_points.for_each_key(|k| {
+            Ok(
+                f(k).unwrap(), // TODO: errors
+            )
+        })?)
     }
 
     pub fn for_each_count_per_value(
@@ -414,7 +414,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         deferred_internal_id: Option<PointOffsetType>,
         mut f: impl FnMut(&N, usize) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        let result = self.storage.value_to_points2.iter();
+        let result = self.storage.value_to_points.iter();
         if let Err(err) = &result {
             debug_assert!(false, "Error while iterating value_to_points: {err:?}");
             log::error!("Error while iterating value_to_points: {err:?}");
@@ -443,7 +443,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
         let deleted = &self.storage.deleted;
 
-        let result = self.storage.value_to_points2.iter();
+        let result = self.storage.value_to_points.iter();
         if let Err(err) = &result {
             debug_assert!(false, "Error while iterating value_to_points: {err:?}");
             log::error!("Error while iterating value_to_points: {err:?}");
@@ -480,7 +480,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     /// Populate all pages in the mmap.
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
-        self.storage.value_to_points2.populate()?;
+        self.storage.value_to_points.populate()?;
         self.storage.point_to_values.populate()?;
         Ok(())
     }
@@ -496,12 +496,10 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         } = self;
         let Storage {
             value_to_points,
-            value_to_points2,
             point_to_values,
             deleted: _,
         } = storage;
-        value_to_points.clear_cache()?;
-        value_to_points2.clear_ram_cache()?;
+        value_to_points.clear_ram_cache()?;
         clear_disk_cache(&path.join(DELETED_PATH))?;
         point_to_values.clear_cache()?;
         Ok(())
