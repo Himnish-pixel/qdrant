@@ -49,7 +49,7 @@ pub struct MmapMapIndex<N: MapIndexKey + Key + ?Sized> {
 }
 
 pub(super) struct Storage<N: MapIndexKey + Key + ?Sized> {
-    pub(super) value_to_points: MmapHashMap<N, PointOffsetType>,
+    value_to_points: MmapHashMap<N, PointOffsetType>,
     point_to_values: StoredPointToValues<N, MmapFile>,
     /// In-memory deletion bitmap. Reconstructed at load time as the union of
     /// the build-time empty-payload bits read from `deleted.bin` and the
