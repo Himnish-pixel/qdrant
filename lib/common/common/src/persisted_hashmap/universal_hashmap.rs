@@ -4,12 +4,13 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::path::Path;
 
-use itertools::Either;
+use itertools::{Either, Itertools};
 use ph::fmph::Function;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::bucket_offsets::BucketOffsets;
 use crate::generic_consts::{Random, Sequential};
+use crate::iterator_ext::ordering_iterator::OrderingIterator;
 use crate::persisted_hashmap::keys::Key;
 use crate::universal_io::{OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead};
 
@@ -128,7 +129,7 @@ impl<
 
     pub fn for_each_key(&self, mut f: impl FnMut(&K) -> Result<()>) -> Result<()> {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_impl(PartialEntryKind::KeyOnly, offsets.into_iter(), |entry| {
+        self.for_each_sparse_impl(PartialEntryKind::KeyOnly, offsets.into_iter(), |entry| {
             let PartialEntry::KeyOnly(key) = entry else {
                 unreachable!()
             };
@@ -136,20 +137,10 @@ impl<
         })
     }
 
-    pub fn for_each_key_and_len(&self, mut f: impl FnMut(&K, usize) -> Result<()>) -> Result<()> {
-        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_impl(PartialEntryKind::KeyAndLen, offsets.into_iter(), |entry| {
-            let PartialEntry::KeyAndLen(key, values_len) = entry else {
-                unreachable!()
-            };
-            f(key, values_len as usize)
-        })
-    }
-
     // TODO: drop for_each_entry
     pub fn for_each_entry_v2(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_impl(
+        self.for_each_sparse_impl(
             PartialEntryKind::KeyAndValues(32), // TODO
             offsets.into_iter(),
             |entry| {
@@ -161,7 +152,7 @@ impl<
         )
     }
 
-    fn for_each_impl(
+    fn for_each_sparse_impl(
         &self,
         entry_kind: PartialEntryKind,
         offsets: impl Iterator<Item = u64>,
@@ -227,6 +218,32 @@ impl<
                 })?;
         }
 
+        Ok(())
+    }
+
+    fn for_each_dense_impl(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
+        let file_len = UniversalRead::<u8>::len(&self.reader)?;
+
+        let mut offset = self.entries_start;
+        let range = ReadRange {
+            byte_offset: offset,
+            length: file_len - offset,
+        };
+
+        let mut buf = Vec::new();
+
+        // TODO: unqualify
+        OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
+            &self.reader,
+            range.iter_autochunks::<u8>().enumerate(),
+        )?)
+        .process_results(|it| {
+            it.for_each(|(_, mini_buf)| {
+
+
+                // TODO
+            })
+        })?;
         Ok(())
     }
 
@@ -671,7 +688,6 @@ fn uio_data_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Uni
 #[derive(Copy, Clone)]
 enum PartialEntryKind {
     KeyOnly,
-    KeyAndLen,
     KeyAndValues(u32),
 }
 
@@ -679,7 +695,6 @@ impl PartialEntryKind {
     fn est_size<K: Key + ?Sized, V>(self) -> usize {
         match self {
             Self::KeyOnly => K::VALUE_SIZE_EST,
-            Self::KeyAndLen => K::VALUE_SIZE_EST + size_of::<ValuesLen>(),
             Self::KeyAndValues(values_len) => {
                 K::VALUE_SIZE_EST + size_of::<ValuesLen>() + size_of::<V>() * (values_len as usize)
             }
@@ -708,10 +723,6 @@ impl PartialEntryKind {
         let values_len =
             ValuesLen::from_le_bytes(data[values_len_start..values_len_end].try_into().unwrap());
 
-        if matches!(self, Self::KeyAndLen) {
-            return Ok(PartialEntry::KeyAndLen(key, values_len));
-        }
-
         let values_start = values_len_end.next_multiple_of(size_of::<V>());
         let values_end = values_start + values_len as usize * size_of::<V>();
 
@@ -728,6 +739,5 @@ impl PartialEntryKind {
 
 enum PartialEntry<'a, K: Key + ?Sized, V> {
     KeyOnly(&'a K),
-    KeyAndLen(&'a K, u32),
     KeyAndValues(&'a K, &'a [V]),
 }
