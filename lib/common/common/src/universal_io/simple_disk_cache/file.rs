@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use roaring::RoaringBitmap;
 
 use super::BLOCK_SIZE;
-use super::config::OnDemandConfig;
+use super::config::DiskCacheConfig;
 use crate::generic_consts::{AccessPattern, Sequential};
 use crate::mmap::{AdviceSetting, Madviseable};
 use crate::universal_io::{
@@ -22,7 +22,7 @@ use crate::universal_io::{
 /// The remote is assumed to be immutable for the lifetime of the file;
 /// this type implements [`UniversalRead`] only, but not [`UniversalWrite`].
 #[derive(Debug)]
-pub struct OnDemandFile<R> {
+pub struct DiskCache<R> {
     remote: R,
     len_bytes: u64,
     /// Open options for when it gets initialized
@@ -47,14 +47,14 @@ struct LocalState {
 
 impl LocalState {
     /// # Safety
-    /// `byte_range` must have been populated via [`OnDemandFile::ensure_byte_ranges`] first.
+    /// `byte_range` must have been populated via [`DiskCache::ensure_byte_ranges`] first.
     unsafe fn read_mmap_bytes(&self, byte_range: Range<u64>) -> &[u8] {
         let bytes = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap.len()) };
         &bytes[byte_range.start as usize..byte_range.end as usize]
     }
 }
 
-impl<R: UniversalReadFileOps> UniversalReadFileOps for OnDemandFile<R> {
+impl<R: UniversalReadFileOps> UniversalReadFileOps for DiskCache<R> {
     fn list_files(prefix_path: &Path) -> Result<Vec<PathBuf>> {
         R::list_files(prefix_path)
     }
@@ -64,16 +64,16 @@ impl<R: UniversalReadFileOps> UniversalReadFileOps for OnDemandFile<R> {
     }
 }
 
-impl<R, T> UniversalRead<T> for OnDemandFile<R>
+impl<R, T> UniversalRead<T> for DiskCache<R>
 where
     R: UniversalRead<u8>,
     T: bytemuck::Pod,
 {
     fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let config = OnDemandConfig::global().ok_or_else(|| {
+        let config = DiskCacheConfig::global().ok_or_else(|| {
             UniversalIoError::uninitialized(
-                "OnDemandConfig must be initialized via `OnDemandConfig::initialize_global` \
-                 before opening an OnDemandFile",
+                "DiskCacheConfig must be initialized via `DiskCacheConfig::initialize_global` \
+                 before opening an DiskCache",
             )
         })?;
         Self::open_with_config(config, path, options)
@@ -131,20 +131,20 @@ where
     }
 
     fn kind() -> UniversalKind {
-        UniversalKind::OnDemand
+        UniversalKind::SimpleDiskCache
     }
 }
 
-impl<R: UniversalRead<u8>> OnDemandFile<R> {
-    /// Open an [`OnDemandFile`] with an explicit configuration
+impl<R: UniversalRead<u8>> DiskCache<R> {
+    /// Open an [`DiskCache`] with an explicit configuration
     pub fn open_with_config(
-        config: &OnDemandConfig,
+        config: &DiskCacheConfig,
         path: impl AsRef<Path>,
         options: OpenOptions,
     ) -> Result<Self> {
         debug_assert!(
             !options.writeable,
-            "OnDemandFile only supports immutable files",
+            "DiskCache only supports immutable files",
         );
 
         let remote_path = path.as_ref();

@@ -7,21 +7,21 @@ use crate::universal_io::{Result, UniversalIoError};
 
 /// Suffix appended to every local cache file so local mirrors can't be
 /// mistaken for the "real" (remote) copy.
-const LOCAL_FILE_SUFFIX: &str = ".ondemand";
+const LOCAL_FILE_SUFFIX: &str = ".partial";
 
-/// Configuration for [`OnDemandFile`](super::OnDemandFile).
+/// Configuration for [`DiskCache`](super::DiskCache).
 ///
 /// Remote files under `remote_dir` are mirrored under `local_dir`, preserving the
 /// relative path with [`LOCAL_FILE_SUFFIX`] appended to the file name.
 #[derive(Debug)]
-pub struct OnDemandConfig {
+pub struct DiskCacheConfig {
     remote_dir: PathBuf,
     local_dir: PathBuf,
 }
 
-static GLOBAL: OnceLock<OnDemandConfig> = OnceLock::new();
+static GLOBAL: OnceLock<DiskCacheConfig> = OnceLock::new();
 
-impl OnDemandConfig {
+impl DiskCacheConfig {
     pub fn new(remote_dir: PathBuf, local_dir: PathBuf) -> Result<Self> {
         let remote_dir = fs::canonicalize(&remote_dir)
             .map_err(|err| UniversalIoError::extract_not_found(err, &remote_dir))?;
@@ -35,13 +35,13 @@ impl OnDemandConfig {
 
     /// Panics on construction failure or if called more than once.
     pub fn initialize_global(remote_dir: PathBuf, local_dir: PathBuf) {
-        let cfg = Self::new(remote_dir, local_dir).expect("failed to initialise OnDemandConfig");
+        let cfg = Self::new(remote_dir, local_dir).expect("failed to initialise DiskCacheConfig");
         GLOBAL
             .set(cfg)
-            .expect("OnDemandConfig is already initialized");
+            .expect("DiskCacheConfig is already initialized");
     }
 
-    pub fn global() -> Option<&'static OnDemandConfig> {
+    pub fn global() -> Option<&'static DiskCacheConfig> {
         GLOBAL.get()
     }
 
@@ -71,12 +71,12 @@ impl OnDemandConfig {
 mod tests {
     use fs_err as fs;
 
-    use super::OnDemandConfig;
+    use super::DiskCacheConfig;
 
     #[test]
     fn strips_remote_dir_and_appends_suffix() {
         let tmp = tempfile::Builder::new()
-            .prefix("ondemand-cfg")
+            .prefix("simplediskcache-tests")
             .tempdir()
             .unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -86,20 +86,20 @@ mod tests {
         let input = remote_dir.join("collections/c/segment/data.bin");
         fs::write(&input, b"").unwrap();
 
-        let cfg = OnDemandConfig::new(remote_dir, local_dir).unwrap();
+        let cfg = DiskCacheConfig::new(remote_dir, local_dir).unwrap();
         let local = cfg.local_path_for(&input).unwrap();
 
         assert_eq!(
             local,
             cfg.local_dir()
-                .join("collections/c/segment/data.bin.ondemand"),
+                .join("collections/c/segment/data.bin.partial"),
         );
     }
 
     #[test]
     fn rejects_path_outside_remote_dir() {
         let tmp = tempfile::Builder::new()
-            .prefix("ondemand-cfg")
+            .prefix("simplediskcache-tests")
             .tempdir()
             .unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -111,7 +111,7 @@ mod tests {
         let outside = other_dir.join("data.bin");
         fs::write(&outside, b"").unwrap();
 
-        let cfg = OnDemandConfig::new(remote_dir, local_dir).unwrap();
+        let cfg = DiskCacheConfig::new(remote_dir, local_dir).unwrap();
         let err = cfg.local_path_for(&outside).unwrap_err();
 
         assert!(

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use fs_err as fs;
 
-use super::{BLOCK_SIZE, OnDemandConfig, OnDemandFile};
+use super::{BLOCK_SIZE, DiskCache, DiskCacheConfig};
 use crate::generic_consts::Sequential;
 #[cfg(target_os = "linux")]
 use crate::universal_io::IoUringFile;
@@ -24,13 +24,13 @@ struct Scenario {
     _tmp: tempfile::TempDir,
     remote_path: PathBuf,
     data: Vec<u8>,
-    config: OnDemandConfig,
+    config: DiskCacheConfig,
 }
 
 impl Scenario {
     fn new(n_bytes: usize) -> Self {
         let tmp = tempfile::Builder::new()
-            .prefix("ondemand")
+            .prefix("disk_cache_tests")
             .tempdir()
             .unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -46,7 +46,7 @@ impl Scenario {
             _tmp: tmp,
             remote_path,
             data,
-            config: OnDemandConfig::new(remote_dir, local_dir).unwrap(),
+            config: DiskCacheConfig::new(remote_dir, local_dir).unwrap(),
         }
     }
 
@@ -54,8 +54,8 @@ impl Scenario {
         self.config.local_path_for(&self.remote_path).unwrap()
     }
 
-    fn open(&self) -> OnDemandFile<Remote> {
-        OnDemandFile::open_with_config(
+    fn open(&self) -> DiskCache<Remote> {
+        DiskCache::open_with_config(
             &self.config,
             &self.remote_path,
             OpenOptions {

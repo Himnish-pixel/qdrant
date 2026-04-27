@@ -4,8 +4,8 @@ mod file;
 #[cfg(test)]
 mod tests;
 
-pub use config::OnDemandConfig;
-pub use file::OnDemandFile;
+pub use config::DiskCacheConfig;
+pub use file::DiskCache;
 
 /// Files are logically split into fixed-size blocks; the roaring bitmap
 /// tracks population on a per-block basis.
