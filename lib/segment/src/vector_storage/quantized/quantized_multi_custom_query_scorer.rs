@@ -100,6 +100,22 @@ where
 {
     type TVector = [TElement];
 
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert_eq!(ids.len(), scores.len());
+
+        let storage = self.quantized_multivector_storage;
+
+        storage.for_each_in_batch(ids, |idx, multi_vectors| {
+            self.hardware_counter
+                .vector_io_read()
+                .incr_delta(size_of::<MultivectorOffset>() + size_of_val(multi_vectors));
+
+            scores[idx] = self.query.score_by(|query| {
+                storage.score(query, multi_vectors, &self.hardware_counter) // comment to disable rustfmt
+            });
+        });
+    }
+
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         let storage = self.quantized_multivector_storage;
         let multi_vectors = storage.get_vector(idx);
