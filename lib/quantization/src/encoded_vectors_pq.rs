@@ -533,17 +533,6 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         EncodedQueryPQ { lut }
     }
 
-    fn score_point(
-        &self,
-        query: &EncodedQueryPQ,
-        i: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> f32 {
-        let centroids = self.encoded_vectors.get_vector_data(i);
-
-        self.score_bytes(True, query, &centroids, hw_counter)
-    }
-
     /// Score two points inside endoded data by their indexes
     /// To find score, this method decode both encoded vectors.
     /// Decocing in PQ is a replacing centroid index by centroid position

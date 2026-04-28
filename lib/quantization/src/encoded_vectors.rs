@@ -49,9 +49,12 @@ pub trait EncodedVectors: Sized {
     fn score_point(
         &self,
         query: &Self::EncodedQuery,
-        i: PointOffsetType,
+        offset: PointOffsetType,
         hw_counter: &HardwareCounterCell,
-    ) -> f32;
+    ) -> f32 {
+        let vector = self.get_vector(offset);
+        self.score(query, &vector, hw_counter)
+    }
 
     fn score_internal(
         &self,

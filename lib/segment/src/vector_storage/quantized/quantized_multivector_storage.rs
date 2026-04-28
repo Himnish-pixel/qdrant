@@ -355,33 +355,6 @@ where
     }
 
     /// Custom `score_max_similarity` implementation for quantized vectors
-    fn score_point_max_similarity(
-        &self,
-        query: &Vec<QuantizedStorage::EncodedQuery>,
-        vector_index: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> ScoreType {
-        let offset = self.offsets.get_offset(vector_index);
-        let mut sum = 0.0;
-        for inner_query in query {
-            let mut max_sim = ScoreType::NEG_INFINITY;
-            // manual `max_by` for performance
-            for i in 0..offset.count {
-                let sim =
-                    self.quantized_storage
-                        .score_point(inner_query, offset.start + i, hw_counter);
-                if sim > max_sim {
-                    max_sim = sim;
-                }
-            }
-            // sum of max similarity
-            sum += max_sim;
-        }
-
-        sum
-    }
-
-    /// Custom `score_max_similarity` implementation for quantized vectors
     fn score_multi_vector_max_similarity(
         &self,
         query: &Vec<QuantizedStorage::EncodedQuery>,
@@ -477,17 +450,6 @@ where
             .multi_vectors()
             .map(|inner_vector| self.quantized_storage.encode_query(inner_vector))
             .collect()
-    }
-
-    fn score_point(
-        &self,
-        query: &Vec<QuantizedStorage::EncodedQuery>,
-        i: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> ScoreType {
-        match self.multi_vector_config.comparator {
-            MultiVectorComparator::MaxSim => self.score_point_max_similarity(query, i, hw_counter),
-        }
     }
 
     fn score_internal(

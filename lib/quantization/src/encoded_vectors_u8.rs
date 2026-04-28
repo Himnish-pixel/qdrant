@@ -602,16 +602,6 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsU8<TStorage> {
         }
     }
 
-    fn score_point(
-        &self,
-        query: &EncodedQueryU8,
-        i: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> f32 {
-        let bytes = self.encoded_vectors.get_vector_data(i);
-        self.score_bytes(True, query, &bytes, hw_counter)
-    }
-
     fn score_internal(
         &self,
         i: PointOffsetType,

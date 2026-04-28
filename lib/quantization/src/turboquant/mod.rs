@@ -328,16 +328,6 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
         self.quantizer.precompute_query(query)
     }
 
-    fn score_point(
-        &self,
-        query: &EncodedQueryTQ,
-        i: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> f32 {
-        let encoded_vector = self.encoded_vectors.get_vector_data(i);
-        self.score_bytes(True, query, &encoded_vector, hw_counter)
-    }
-
     /// Score two points inside endoded data by their indexes
     fn score_internal(
         &self,
