@@ -90,6 +90,21 @@ where
 {
     type TVector = [TElement];
 
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert_eq!(ids.len(), scores.len());
+
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(ids.len() * self.quantized_storage.quantized_vector_size());
+
+        let storage = self.quantized_storage;
+        storage.for_each_in_batch(ids, |idx, encoded_vector| {
+            scores[idx] = self.query.score_by(|query| {
+                storage.score(query, encoded_vector, &self.hardware_counter) // comment to disable rustfmt
+            });
+        });
+    }
+
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         // account for read outside of `score_by` because the closure is called once per example
         self.hardware_counter
