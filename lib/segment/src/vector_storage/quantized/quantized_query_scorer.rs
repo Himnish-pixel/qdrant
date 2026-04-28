@@ -84,8 +84,10 @@ where
         self.hardware_counter
             .vector_io_read()
             .incr_delta(self.quantized_data.quantized_vector_size());
+
+        let vector = self.quantized_data.get_vector(idx);
         self.quantized_data
-            .score_point(&self.query, idx, &self.hardware_counter)
+            .score(&self.query, &vector, &self.hardware_counter)
     }
 
     fn score(&self, _v2: &[VectorElementType]) -> ScoreType {

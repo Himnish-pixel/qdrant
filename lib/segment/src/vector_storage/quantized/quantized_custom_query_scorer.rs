@@ -95,9 +95,11 @@ where
         self.hardware_counter
             .vector_io_read()
             .incr_delta(self.quantized_storage.quantized_vector_size());
-        self.query.score_by(|this| {
-            self.quantized_storage
-                .score_point(this, idx, &self.hardware_counter)
+
+        let storage = self.quantized_storage;
+        let vector = storage.get_vector(idx);
+        self.query.score_by(|query| {
+            storage.score(query, &vector, &self.hardware_counter) // comment to disable rustfmt
         })
     }
 
