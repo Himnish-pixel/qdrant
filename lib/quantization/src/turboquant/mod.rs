@@ -419,6 +419,14 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
     }
 
     #[inline]
+    fn for_each_in_batch<F>(&self, offsets: &[impl UniversalOffset], callback: F)
+    where
+        F: FnMut(usize, &[u8]),
+    {
+        self.encoded_vectors.for_each_in_batch(offsets, callback);
+    }
+
+    #[inline]
     fn score(
         &self,
         query: &Self::EncodedQuery,

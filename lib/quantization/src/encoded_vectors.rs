@@ -90,6 +90,10 @@ pub trait EncodedVectors: Sized {
 
     fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]>;
 
+    fn for_each_in_batch<F>(&self, offsets: &[impl UniversalOffset], callback: F)
+    where
+        F: FnMut(usize, &[u8]);
+
     fn score(
         &self,
         query: &Self::EncodedQuery,
