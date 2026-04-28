@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use bytemuck::TransparentWrapper;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::Random;
 use common::mmap::{Advice, AdviceSetting, MmapFlusher};
@@ -9,8 +10,8 @@ use common::universal_io::MmapFile;
 use quantization::encoded_storage::UniversalOffset;
 
 use crate::common::operation_error::OperationResult;
-use crate::vector_storage::VectorOffsetType;
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
+use crate::vector_storage::{VectorOffset, VectorOffsetType};
 
 pub struct QuantizedChunkedMmapStorage {
     data: ChunkedVectors<u8, MmapFile>,
@@ -47,6 +48,14 @@ impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
         self.data
             .get_many::<Random>(offset.start() as _, offset.count() as _)
             .unwrap_or_default()
+    }
+
+    fn for_each_in_batch<F>(&self, offsets: &[impl UniversalOffset], callback: F)
+    where
+        F: FnMut(usize, &[u8]),
+    {
+        let offset = MultivectorOffsetWrapper::wrap_slice(offsets);
+        self.data.for_each_in_batch(offset, callback);
     }
 
     fn upsert_vector(
@@ -137,5 +146,19 @@ impl quantization::EncodedStorageBuilder for QuantizedChunkedMmapStorageBuilder 
             .push(other, &self.hw_counter)
             .map(|_| ())
             .map_err(|e| std::io::Error::other(format!("Failed to push vector data: {e}")))
+    }
+}
+
+#[derive(Copy, Clone, Debug, bytemuck::TransparentWrapper)]
+#[repr(transparent)]
+struct MultivectorOffsetWrapper<T>(T);
+
+impl<T: UniversalOffset> VectorOffset for MultivectorOffsetWrapper<T> {
+    fn offset(self) -> VectorOffsetType {
+        self.0.start() as _
+    }
+
+    fn multi_vector_count(self) -> usize {
+        self.0.count() as _
     }
 }

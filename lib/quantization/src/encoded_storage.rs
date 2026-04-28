@@ -21,6 +21,16 @@ use fs_err::File;
 pub trait EncodedStorage {
     fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]>;
 
+    fn for_each_in_batch<F>(&self, offsets: &[impl UniversalOffset], mut callback: F)
+    where
+        F: FnMut(usize, &[u8]),
+    {
+        for (idx, &offset) in offsets.iter().enumerate() {
+            let vector = self.get_vector_data(offset);
+            callback(idx, &vector);
+        }
+    }
+
     fn is_on_disk(&self) -> bool;
 
     fn upsert_vector(
