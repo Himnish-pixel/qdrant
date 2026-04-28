@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -7,6 +8,7 @@ use common::types::PointOffsetType;
 use serde::{Deserialize, Serialize};
 
 use crate::EncodingError;
+use crate::encoded_storage::UniversalOffset;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceType {
@@ -85,6 +87,15 @@ pub trait EncodedVectors: Sized {
     fn heap_size_bytes(&self) -> usize {
         0
     }
+
+    fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]>;
+
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32;
 
     type SupportsBytes: TBool;
     fn score_bytes(

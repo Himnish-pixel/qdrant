@@ -12,7 +12,7 @@ use fs_err as fs;
 use serde::{Deserialize, Serialize};
 
 use crate::EncodingError;
-use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
+use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, UniversalOffset};
 use crate::encoded_vectors::{
     DistanceType, EncodedVectors, VectorParameters, validate_vector_parameters,
 };
@@ -713,6 +713,21 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsU8<TStorage> {
         } = self;
 
         encoded_vectors.heap_size_bytes()
+    }
+
+    #[inline]
+    fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        self.encoded_vectors.get_vector_data(offset)
+    }
+
+    #[inline]
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
     }
 
     type SupportsBytes = True;

@@ -19,7 +19,7 @@ use fs_err as fs;
 use serde::{Deserialize, Serialize};
 
 use crate::EncodingError;
-use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
+use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, UniversalOffset};
 use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
 use crate::turboquant::quantization::{ErrorCorrection, TurboQuantizer};
 use crate::turboquant::simd::{Query1bitSimd, Query2bitSimd, Query4bitSimd};
@@ -411,6 +411,21 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
             files.push(meta_path.clone());
         }
         files
+    }
+
+    #[inline]
+    fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        self.encoded_vectors.get_vector_data(offset)
+    }
+
+    #[inline]
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
     }
 
     type SupportsBytes = True;

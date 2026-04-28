@@ -15,6 +15,7 @@ use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
+use crate::encoded_storage::UniversalOffset;
 use crate::encoded_vectors::validate_vector_parameters;
 use crate::vector_stats::{VectorElementStats, VectorStats};
 use crate::{
@@ -943,6 +944,21 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
             .map(|vs| vs.elements_stats.capacity() * std::mem::size_of::<VectorElementStats>())
             .unwrap_or(0);
         storage_heap + vector_stats_heap
+    }
+
+    #[inline]
+    fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        self.encoded_vectors.get_vector_data(offset)
+    }
+
+    #[inline]
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
     }
 
     type SupportsBytes = True;

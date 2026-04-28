@@ -19,7 +19,7 @@ use fs_err as fs;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
+use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, UniversalOffset};
 use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
 use crate::kmeans::kmeans;
 use crate::{ConditionalVariable, EncodingError};
@@ -655,6 +655,21 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         let vector_division_heap =
             self.metadata.vector_division.capacity() * std::mem::size_of::<Range<usize>>();
         storage_heap + centroids_heap + vector_division_heap
+    }
+
+    #[inline]
+    fn get_vector(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        self.encoded_vectors.get_vector_data(offset)
+    }
+
+    #[inline]
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
     }
 
     type SupportsBytes = True;
