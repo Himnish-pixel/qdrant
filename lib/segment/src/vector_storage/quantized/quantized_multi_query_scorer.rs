@@ -77,15 +77,14 @@ where
     type TVector = [TElement];
 
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        let multi_vector_offset = self.quantized_multivector_storage.get_offset(idx);
-        let sub_vectors_count = multi_vector_offset.count as usize;
-        self.hardware_counter.vector_io_read().incr_delta(
-            size_of::<MultivectorOffset>()
-                + self.quantized_multivector_storage.quantized_vector_size() * sub_vectors_count,
-        );
-        // quantized multivector storage handles hardware counter to batch vector IO
-        self.quantized_multivector_storage
-            .score_point(&self.query, idx, &self.hardware_counter)
+        let storage = self.quantized_multivector_storage;
+        let multi_vectors = storage.get_vector(idx);
+
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(size_of::<MultivectorOffset>() + size_of_val(multi_vectors.as_ref()));
+
+        storage.score(&self.query, &multi_vectors, &self.hardware_counter)
     }
 
     fn score(&self, _v2: &[TElement]) -> ScoreType {
