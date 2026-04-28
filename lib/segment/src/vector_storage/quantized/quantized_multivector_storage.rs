@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,7 @@ use common::universal_io::MmapFile;
 use fs_err as fs;
 use memmap2::MmapMut;
 use quantization::EncodedVectors;
+use quantization::encoded_storage::UniversalOffset;
 use serde::{Deserialize, Serialize};
 
 use crate::common::operation_error::OperationResult;
@@ -33,6 +35,16 @@ use crate::vector_storage::chunked_vectors::ChunkedVectors;
 pub struct MultivectorOffset {
     pub start: PointOffsetType,
     pub count: PointOffsetType,
+}
+
+impl quantization::encoded_storage::UniversalOffset for MultivectorOffset {
+    fn start(self) -> PointOffsetType {
+        self.start
+    }
+
+    fn count(self) -> PointOffsetType {
+        self.count
+    }
 }
 
 pub trait MultivectorOffsets {
@@ -365,6 +377,39 @@ where
             // sum of max similarity
             sum += max_sim;
         }
+
+        sum
+    }
+
+    /// Custom `score_max_similarity` implementation for quantized vectors
+    fn score_multi_vector_max_similarity(
+        &self,
+        query: &Vec<QuantizedStorage::EncodedQuery>,
+        multi_vectors: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> ScoreType {
+        assert_eq!(multi_vectors.len() % self.quantized_vector_size(), 0);
+
+        let mut sum = 0.0;
+
+        for inner_query in query {
+            let mut max_sim = ScoreType::NEG_INFINITY;
+
+            // manual `max_by` for performance
+            for vector in multi_vectors.chunks(self.quantized_vector_size()) {
+                let sim = self
+                    .quantized_storage
+                    .score(inner_query, vector, hw_counter);
+
+                if sim > max_sim {
+                    max_sim = sim;
+                }
+            }
+
+            // sum of max similarity
+            sum += max_sim;
+        }
+
         sum
     }
 
@@ -553,6 +598,29 @@ where
         } = self;
 
         quantized_storage.heap_size_bytes() + offsets.heap_size_bytes()
+    }
+
+    fn get_vector(&self, point_offset: impl UniversalOffset) -> Cow<'_, [u8]> {
+        // `QuantizedMultivectorStorage` only expects single-vector offsets
+        debug_assert_eq!(point_offset.count(), 1);
+
+        let multi_offset = self.offsets.get_offset(point_offset.start());
+        self.quantized_storage.get_vector(multi_offset)
+    }
+
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        multi_vectors: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        debug_assert_eq!(multi_vectors.len() % self.quantized_vector_size(), 0);
+
+        match self.multi_vector_config.comparator {
+            MultiVectorComparator::MaxSim => {
+                self.score_multi_vector_max_similarity(query, multi_vectors, hw_counter)
+            }
+        }
     }
 
     type SupportsBytes = False;
