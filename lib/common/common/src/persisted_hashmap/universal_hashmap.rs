@@ -241,7 +241,6 @@ impl<
         )?)
         .process_results(|it| {
             it.for_each(|(_, mini_buf)| {
-
                 // TODO
             })
         })?;
