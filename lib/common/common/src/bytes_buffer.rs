@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::fmt::Debug;
 
 use bytes::{Buf, BytesMut};
 
 /// Producer-consumer buffer for streaming data.
-/// 
+///
 /// Producer appends data to one side of FIFO buffer;
 /// consumer consumes data from the other side.
 ///
@@ -22,7 +23,7 @@ pub enum StreamBufferStep {
     WantContiguos(usize),
 }
 
-impl<T: Clone> StreamBuffer<T> {
+impl<T: Clone + Debug> StreamBuffer<T> {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -32,52 +33,52 @@ impl<T: Clone> StreamBuffer<T> {
 
     fn process(
         &mut self,
-        new_data: &[T],
+        mut new_items: &[T],
         mut consumer: impl FnMut(&[T], &[T]) -> StreamBufferStep,
     ) {
-        let mut new_start = 0;
-
+        // Step 1: Handle leftovers from previous steps.
+        // In practice, this loop will have at max 2 iterations:
+        // - `WantContiguos(too big)` -> early return
+        // - `WantContiguos(fits)`, then `Consumed` -> proceed to step 2.
         loop {
             let buf_len = self.buf.len() - self.start;
-            let new_len = new_data.len() - new_start;
-
-            let (part1, part2) = if buf_len > 0 {
-                (&self.buf[self.start..], &new_data[new_start..])
-            } else {
-                (&new_data[new_start..], &[][..])
-            };
-
-            match consumer(part1, part2) {
+            if buf_len == 0 {
+                break;
+            }
+            match consumer(&self.buf[self.start..], new_items) {
                 StreamBufferStep::Consumed(count) => {
-                    let from_buf = count.min(buf_len);
-                    self.start += from_buf;
-                    new_start += count - from_buf;
+                    break;
+                }
+                StreamBufferStep::WantContiguos(count) if count > buf_len + new_items.len() => {
+                    self.prepare_leftovers(new_items);
+                    return;
                 }
                 StreamBufferStep::WantContiguos(count) => {
-                    if buf_len >= count {
-                        continue;
-                    }
-                    if buf_len + new_len < count {
-                        break;
-                    }
-                    let need = count - buf_len;
-                    self.append(&new_data[new_start..new_start + need]);
-                    new_start += need;
+                    self.prepare_leftovers(&new_items[..count - buf_len]);
+                    new_items = &new_items[count - buf_len..];
                 }
             }
         }
 
-        if new_start < new_data.len() {
-            self.append(&new_data[new_start..]);
+        // Step 2: Main loop.
+        // Consume `new_items` without copying them into `self.buf`.
+        while new_items.len() != 0 {
+            match consumer(new_items, &[]) {
+                StreamBufferStep::Consumed(count) => new_items = &new_items[count..],
+                StreamBufferStep::WantContiguos(_) => break,
+            }
         }
+
+        // Step 3: Prepare leftovers for the next step.
+        self.prepare_leftovers(new_items);
+    }
+
+    fn prepare_leftovers(&mut self, items: &[T]) {
         if self.start == self.buf.len() {
             self.buf.clear();
             self.start = 0;
-        }
-    }
-
-    fn append(&mut self, items: &[T]) {
-        if self.start > 0 && self.buf.len() + items.len() > self.buf.capacity() {
+        } else if self.buf.len() + items.len() > self.buf.capacity() {
+            // An optimization. The next `extend_from_slice` will reallocate and copy.
             self.buf.drain(..self.start);
             self.start = 0;
         }
@@ -102,7 +103,7 @@ mod tests {
         //   If a chunk is not contiguous, consumers asks fo
         //   If not enough data or data is not contiguous, consumer not proceeds.
 
-        for _ in 0..10 {
+        for _ in 0..100 {
             let mut buf = StreamBuffer::new();
 
             let mut consumer_pos = 0;
@@ -117,6 +118,7 @@ mod tests {
                 producer_pos = next_producer_pos;
 
                 buf.process(&new_data, |part1, part2| {
+                    eprintln!("part1={:?}, part2={:?}", part1, part2);
                     // Check that the data is correct.
                     assert_equal(
                         part1.iter().chain(part2.iter()).copied(),
