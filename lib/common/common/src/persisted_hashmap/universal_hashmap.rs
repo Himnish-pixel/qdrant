@@ -231,8 +231,7 @@ impl<
             length: file_len - offset,
         };
 
-        // let mut buf_vec = Vec::new();
-        // let mut buf = &[];
+        let mut buf_vec = Vec::new();
 
         // TODO: unqualify
         OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
@@ -241,7 +240,12 @@ impl<
         )?)
         .process_results(|it| {
             it.for_each(|(_, mini_buf)| {
-                // TODO
+                if buf_vec.is_empty() {
+                    let pos = 0;
+                    loop {
+                    }
+
+                }
             })
         })?;
 
