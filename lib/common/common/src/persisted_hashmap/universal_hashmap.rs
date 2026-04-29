@@ -12,6 +12,7 @@ use super::bucket_offsets::BucketOffsets;
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
 use crate::persisted_hashmap::keys::Key;
+use crate::universal_io::read::UniversalReadPipeline;
 use crate::universal_io::{OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead};
 
 type ValuesLen = u32;
@@ -230,7 +231,8 @@ impl<
             length: file_len - offset,
         };
 
-        let mut buf = Vec::new();
+        // let mut buf_vec = Vec::new();
+        // let mut buf = &[];
 
         // TODO: unqualify
         OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
@@ -240,10 +242,10 @@ impl<
         .process_results(|it| {
             it.for_each(|(_, mini_buf)| {
 
-
                 // TODO
             })
         })?;
+
         Ok(())
     }
 

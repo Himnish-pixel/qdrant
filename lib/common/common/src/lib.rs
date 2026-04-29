@@ -5,6 +5,7 @@ pub mod bitpacking_ordered;
 pub mod bitvec;
 pub mod budget;
 pub mod bytes;
+pub mod bytes_buffer;
 pub mod counter;
 pub mod cow;
 pub mod cpu;

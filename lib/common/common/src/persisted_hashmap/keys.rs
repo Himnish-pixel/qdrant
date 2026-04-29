@@ -16,6 +16,8 @@ pub trait Key: Sync + Hash {
     /// Returns number of bytes which `write` will write.
     fn write_bytes(&self) -> usize;
 
+    fn size_from_raw(buf: impl Iterator<Item = u8>) -> Option<usize>;
+
     /// Write the key to `buf`.
     fn write(&self, buf: &mut impl Write) -> io::Result<()>;
 
@@ -37,6 +39,10 @@ impl Key for str {
 
     fn write_bytes(&self) -> usize {
         self.len() + 1
+    }
+
+    fn size_from_raw(mut bytes: impl Iterator<Item = u8>) -> Option<usize> {
+        bytes.position(|b| b == 0xFF)
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -96,6 +102,10 @@ impl Key for i64 {
         Self::VALUE_SIZE_EST
     }
 
+    fn size_from_raw(_: impl Iterator<Item = u8>) -> Option<usize> {
+        Some(Self::VALUE_SIZE_EST)
+    }
+
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
         buf.write_all(self.as_bytes())
     }
@@ -122,6 +132,10 @@ impl Key for u128 {
 
     fn write_bytes(&self) -> usize {
         Self::VALUE_SIZE_EST
+    }
+
+    fn size_from_raw(_: impl Iterator<Item = u8>) -> Option<usize> {
+        Some(Self::VALUE_SIZE_EST)
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
