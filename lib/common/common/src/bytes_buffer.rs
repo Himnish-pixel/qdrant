@@ -1,14 +1,8 @@
-use std::collections::VecDeque;
 use std::fmt::Debug;
 
 use bytes::{Buf, BytesMut};
 
-/// Producer-consumer buffer for streaming data.
-///
-/// Producer appends data to one side of FIFO buffer;
-/// consumer consumes data from the other side.
-///
-/// Optimized to avoid allocations/copying:
+/// Producer-consumer FIFO. Optimized to avoid copying data.
 struct StreamBuffer<T> {
     buf: Vec<T>,
     start: usize,
@@ -16,30 +10,49 @@ struct StreamBuffer<T> {
 
 #[derive(Debug)]
 pub enum StreamBufferStep {
-    /// Advance the buffer by this amount of items.
+    /// Advance the FIFO by this amount of items.
     Consumed(usize),
-    /// Request the buffer to be contiguous for the next `usize` items.
-    /// Don't advance the buffer.
+    /// Indicate that the consumer wants a contiguous slice of at least this
+    /// size. Don't advance the FIFO.
     WantContiguos(usize),
 }
 
+impl StreamBufferStep {
+    pub fn not_enough_data() -> Self {
+        // Pass a very big number. In practice, `process` will break the loop
+        // at this point.
+        Self::WantContiguos(usize::MAX)
+    }
+}
+
 impl<T: Clone + Debug> StreamBuffer<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buf: Vec::new(),
             start: 0,
         }
     }
 
-    fn process(
+    /// Short: append `new_items` to the FIFO and call `consumer` in a loop.
+    ///
+    /// Long: but with zero-copy optimizations. Most of the new items would not
+    /// be copied into the internal buffer. Instead, the `customer` will be
+    /// served directly from `new_items`, unless it spans across more than one
+    /// `new_items` chunks.
+    ///
+    /// This optimization imposes a bit awkward API: the `consumer` gets two
+    /// slices. If you concatenate them, you get the whole FIFO. So, it's like
+    /// [`std::collections::VecDeque::as_slices`].
+    ///
+    /// If the consumer needs a contiguous slice of a certain size, it can
+    /// return [`StreamBufferStep::WantContiguos`] with the required size.
+    /// This method will expand the first slice and call the consumer again.
+    pub fn process(
         &mut self,
         mut new_items: &[T],
         mut consumer: impl FnMut(&[T], &[T]) -> StreamBufferStep,
     ) {
-        // Step 1: Handle leftovers from previous steps.
-        // In practice, this loop will have at max 2 iterations:
-        // - `WantContiguos(too big)` -> early return
-        // - `WantContiguos(fits)`, then `Consumed` -> proceed to step 2.
+        // Step 1: Handle leftovers from previous iterations.
         loop {
             let buf_len = self.buf.len() - self.start;
             if buf_len == 0 {
@@ -47,15 +60,22 @@ impl<T: Clone + Debug> StreamBuffer<T> {
             }
             match consumer(&self.buf[self.start..], new_items) {
                 StreamBufferStep::Consumed(count) => {
+                    self.start += count.min(buf_len);
+                    new_items = &new_items[count.saturating_sub(buf_len)..];
                     break;
                 }
                 StreamBufferStep::WantContiguos(count) if count > buf_len + new_items.len() => {
-                    self.prepare_leftovers(new_items);
+                    // Not enough data in the FIFO at this moment.
+                    self.extend(new_items);
                     return;
                 }
                 StreamBufferStep::WantContiguos(count) => {
-                    self.prepare_leftovers(&new_items[..count - buf_len]);
-                    new_items = &new_items[count - buf_len..];
+                    let (part1, part2) = new_items.split_at(count.saturating_sub(buf_len));
+                    self.extend(part1);
+                    new_items = part2;
+                    // We expect `Consumed(count)` on the next iteration, so
+                    // this loop will take at most two iterations unless the
+                    // `consumer` misbehaves.
                 }
             }
         }
@@ -69,16 +89,15 @@ impl<T: Clone + Debug> StreamBuffer<T> {
             }
         }
 
-        // Step 3: Prepare leftovers for the next step.
-        self.prepare_leftovers(new_items);
+        // Step 3: Prepare leftovers for the next iteration.
+        self.extend(new_items);
     }
 
-    fn prepare_leftovers(&mut self, items: &[T]) {
+    fn extend(&mut self, items: &[T]) {
         if self.start == self.buf.len() {
             self.buf.clear();
             self.start = 0;
         } else if self.buf.len() + items.len() > self.buf.capacity() {
-            // An optimization. The next `extend_from_slice` will reallocate and copy.
             self.buf.drain(..self.start);
             self.start = 0;
         }
