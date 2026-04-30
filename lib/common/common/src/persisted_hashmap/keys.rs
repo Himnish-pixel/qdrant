@@ -1,8 +1,16 @@
+use std::convert::Infallible;
 use std::hash::Hash;
 use std::io::Write;
 use std::{io, str};
 
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{ConvertError, FromBytes, IntoBytes};
+
+pub enum ReadError {
+    Invalid,
+    Incomplete,
+}
+
+pub type ReadResult<T> = Result<T, ReadError>;
 
 /// A key that can be stored in the hash map.
 pub trait Key: Sync + Hash {
@@ -26,6 +34,14 @@ pub trait Key: Sync + Hash {
 
     /// Try to read the key from `buf`.
     fn from_bytes(buf: &[u8]) -> Option<&Self>;
+
+    /// Try to read the key from `buf`.
+    ///
+    /// This method can be called on an incomplete buffer. If it returns
+    /// [`ReadError::Incomplete`], the caller will call this method again with
+    /// new data appended to `buf`. New bytes are `buf[prev_size..]`. On first
+    /// invocation, `prev_size` is 0.
+    fn from_bytes_streaming(buf: &[u8], prev_size: usize) -> ReadResult<&Self>;
 
     fn fixed_size() -> Option<u64>;
 }
@@ -86,6 +102,13 @@ impl Key for str {
         str::from_utf8(&buf[..len]).ok()
     }
 
+    fn from_bytes_streaming(buf: &[u8], prev_size: usize) -> ReadResult<&Self> {
+        let Some(sentinel_pos) = buf.iter().skip(prev_size).position(|&b| b == 0xFF) else {
+            return Err(ReadError::Incomplete);
+        };
+        str::from_utf8(&buf[..prev_size + sentinel_pos]).map_err(|_| ReadError::Invalid)
+    }
+
     fn fixed_size() -> Option<u64> {
         None
     }
@@ -116,6 +139,10 @@ impl Key for i64 {
 
     fn from_bytes(buf: &[u8]) -> Option<&Self> {
         Some(i64::ref_from_prefix(buf).ok()?.0)
+    }
+
+    fn from_bytes_streaming(buf: &[u8], _prev_size: usize) -> ReadResult<&Self> {
+        Ok(Self::ref_from_prefix(buf)?.0)
     }
 
     fn fixed_size() -> Option<u64> {
@@ -157,7 +184,20 @@ impl Key for u128 {
         }
     }
 
+    fn from_bytes_streaming(buf: &[u8], _prev_size: usize) -> ReadResult<&Self> {
+        Ok(Self::ref_from_prefix(buf)?.0)
+    }
+
     fn fixed_size() -> Option<u64> {
         Some(size_of::<u128>() as u64)
+    }
+}
+
+impl<A, S> From<ConvertError<A, S, Infallible>> for ReadError {
+    fn from(err: ConvertError<A, S, Infallible>) -> ReadError {
+        match err {
+            ConvertError::Alignment(_) => ReadError::Invalid,
+            ConvertError::Size(_) => ReadError::Incomplete,
+        }
     }
 }

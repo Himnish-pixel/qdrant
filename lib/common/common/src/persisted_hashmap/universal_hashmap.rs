@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::path::Path;
 
+use aligned_vec::AVec;
 use itertools::{Either, Itertools};
 use ph::fmph::Function;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -11,8 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use super::bucket_offsets::BucketOffsets;
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
-use crate::persisted_hashmap::keys::Key;
-use crate::universal_io::read::UniversalReadPipeline;
+use crate::persisted_hashmap::keys::{Key, ReadError, ReadResult};
 use crate::universal_io::{OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead};
 
 type ValuesLen = u32;
@@ -225,29 +225,57 @@ impl<
     fn for_each_dense_impl(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
-        let mut offset = self.entries_start;
         let range = ReadRange {
-            byte_offset: offset,
-            length: file_len - offset,
+            byte_offset: self.entries_start,
+            length: file_len - self.entries_start,
         };
 
-        let mut buf_vec = Vec::new();
+        let align = K::ALIGN.max(size_of::<ValuesLen>()).max(size_of::<V>());
+        let mut buf = AVec::<u8>::new(align);
+        let mut buf_pos = 0;
 
-        // TODO: unqualify
+        let mut state = State { key_size: None };
+
         OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
             &self.reader,
             range.iter_autochunks::<u8>().enumerate(),
         )?)
-        .process_results(|it| {
-            it.for_each(|(_, mini_buf)| {
-                if buf_vec.is_empty() {
-                    let pos = 0;
-                    loop {
-                    }
+        .process_results(|it| -> Result<()> {
+            for (_, mini_buf) in it {
+                buf.extend_from_slice(&mini_buf);
 
+                let mut view: &[u8] = &buf;
+                loop {
+                    match parse_entry(view, &mut state, buf_pos) {
+                        Ok((data, key, values)) => {
+                            f(key, values)?;
+                            view = data;
+                            state.key_size = None;
+                            buf_pos = 0;
+                        }
+                        Err(ReadError::Incomplete) => {
+                            buf_pos = view.len();
+                            break;
+                        }
+                        Err(ReadError::Invalid) => {
+                            return Err(uio_data_err("Failed to parse entry from bytes"));
+                        }
+                    }
                 }
-            })
-        })?;
+
+                let remaining = view.len();
+                let consumed = buf.len() - remaining;
+                buf.copy_within(consumed.., 0);
+                buf.truncate(remaining);
+            }
+            Ok(())
+        })??;
+
+        if !buf.is_empty() {
+            return Err(uio_data_err(
+                "Trailing bytes left after parsing all entries",
+            ));
+        }
 
         Ok(())
     }
@@ -745,4 +773,52 @@ impl PartialEntryKind {
 enum PartialEntry<'a, K: Key + ?Sized, V> {
     KeyOnly(&'a K),
     KeyAndValues(&'a K, &'a [V]),
+}
+
+struct State {
+    key_size: Option<usize>,
+}
+
+fn advance_slice_by(data: &[u8], by: usize) -> ReadResult<&[u8]> {
+    data.get(by..).ok_or(ReadError::Incomplete)
+}
+fn advance_slice_to_align(align: usize, data: &[u8]) -> ReadResult<&[u8]> {
+    advance_slice_by(data, data.as_ptr().align_offset(align))
+}
+
+fn parse_entry<'a, K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>(
+    buf: &'a [u8],
+    state: &mut State,
+    new_pos: usize,
+) -> ReadResult<(&'a [u8], &'a K, &'a [V])> {
+    // padding            padding                padding
+    // ####### [ key... ] ####### [ values_len ] ####### [ values... ]
+    // ^                  ^                      ^
+    let data = advance_slice_to_align(K::ALIGN, buf)?;
+    let entry_start_offset = buf.len() - data.len();
+
+    let key_size;
+    match state.key_size {
+        Some(s) => key_size = s,
+        None => {
+            let key = K::from_bytes_streaming(data, new_pos.saturating_sub(entry_start_offset))?;
+            key_size = key.write_bytes();
+            state.key_size = Some(key_size);
+        }
+    }
+
+    // The writer pads the key tail and the values_len tail to a multiple
+    // of size_of::<V>() (not to the natural alignment of the trailing
+    // field). Mirror that here.
+    let v_size = size_of::<V>();
+    let data = advance_slice_by(data, key_size.next_multiple_of(v_size))?;
+    let (&values_len, data) = ValuesLen::ref_from_prefix(data)?;
+    let values_len_pad = size_of::<ValuesLen>().next_multiple_of(v_size) - size_of::<ValuesLen>();
+    let data = advance_slice_by(data, values_len_pad)?;
+    let (values, data) = <[V]>::ref_from_prefix_with_elems(data, values_len as usize)?;
+
+    let key = K::from_bytes(&buf[entry_start_offset..buf.len() - data.len()])
+        .ok_or(ReadError::Invalid)?;
+
+    Ok((data, key, values))
 }
