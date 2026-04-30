@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use bytemuck::TransparentWrapper;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::generic_consts::Random;
 use common::mmap::{Advice, AdviceSetting, MmapFlusher};
 use common::types::PointOffsetType;
 use common::universal_io::MmapFile;
@@ -46,16 +45,22 @@ impl QuantizedChunkedMmapStorage {
 impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
     fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
         self.data
-            .get_many::<Random>(offset.start() as _, offset.count() as _)
+            .get_many_splice(offset.start() as _, offset.count() as _)
             .unwrap_or_default()
     }
 
-    fn for_each_in_batch<F>(&self, offsets: &[impl UniversalOffset], callback: F)
+    fn for_each_in_batch<O, F>(&self, offsets: &[O], callback: F)
     where
+        O: UniversalOffset,
         F: FnMut(usize, &[u8]),
     {
-        let offset = MultivectorOffsetWrapper::wrap_slice(offsets);
-        self.data.for_each_in_batch(offset, callback);
+        let offsets = MultivectorOffsetWrapper::wrap_slice(offsets);
+
+        if O::MULTI_VECTOR {
+            self.data.for_each_in_batch_splice(offsets, callback);
+        } else {
+            self.data.for_each_in_batch(offsets, callback);
+        }
     }
 
     fn upsert_vector(
