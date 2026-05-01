@@ -471,7 +471,7 @@ impl MmapInvertedIndex {
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
         self.storage.postings.populate()?;
-        self.storage.vocab.populate()?;
+        self.storage.vocab2.populate()?;
         self.storage.point_to_tokens_count.populate()?;
         Ok(())
     }
@@ -486,13 +486,13 @@ impl MmapInvertedIndex {
         } = self;
         let Storage {
             postings,
-            vocab,
-            vocab2: _,
+            vocab: _,
+            vocab2,
             point_to_tokens_count,
             deleted_points: _,
         } = storage;
         postings.clear_cache()?;
-        vocab.clear_cache()?;
+        vocab2.clear_ram_cache()?;
         point_to_tokens_count.clear_cache()?;
         clear_disk_cache(&path.join(DELETED_POINTS_FILE))?;
         Ok(())
