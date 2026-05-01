@@ -398,15 +398,8 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         }
     }
 
-    pub fn for_each_value(
-        &self,
-        mut f: impl FnMut(&N) -> OperationResult<()>,
-    ) -> OperationResult<()> {
-        Ok(self.storage.value_to_points.for_each_key(|k| {
-            Ok(
-                f(k).unwrap(), // TODO: errors
-            )
-        })?)
+    pub fn for_each_value(&self, f: impl FnMut(&N) -> OperationResult<()>) -> OperationResult<()> {
+        self.storage.value_to_points.for_each_key(f)
     }
 
     pub fn for_each_count_per_value(
@@ -414,12 +407,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         deferred_internal_id: Option<PointOffsetType>,
         mut f: impl FnMut(&N, usize) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        let result = self.storage.value_to_points.iter();
-        if let Err(err) = &result {
-            debug_assert!(false, "Error while iterating value_to_points: {err:?}");
-            log::error!("Error while iterating value_to_points: {err:?}");
-        }
-        result.into_iter().flatten().try_for_each(|(k, v)| {
+        self.storage.value_to_points.for_each_entry(|k, v| {
             let count = v
                 .iter()
                 .filter(|&&idx| {
@@ -443,18 +431,14 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
         let deleted = &self.storage.deleted;
 
-        let result = self.storage.value_to_points.iter();
-        if let Err(err) = &result {
-            debug_assert!(false, "Error while iterating value_to_points: {err:?}");
-            log::error!("Error while iterating value_to_points: {err:?}");
-        }
-        result.into_iter().flatten().try_for_each(move |(k, v)| {
+        self.storage.value_to_points.for_each_entry(|k, v| {
             hw_counter
                 .payload_index_io_read_counter()
                 .incr_delta(k.borrow().write_bytes());
 
             let mut iter = v
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|idx| !deleted.get_bit(*idx as usize).unwrap_or(true))
                 .measure_hw_with_acc(
                     hw_counter.new_accumulator(),

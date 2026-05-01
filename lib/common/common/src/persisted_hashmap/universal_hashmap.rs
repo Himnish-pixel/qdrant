@@ -5,7 +5,7 @@ use std::mem::size_of;
 use std::path::Path;
 
 use aligned_vec::AVec;
-use itertools::{Either, Itertools};
+use itertools::Either;
 use ph::fmph::Function;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -128,7 +128,10 @@ impl<
         self.header.buckets_count as usize
     }
 
-    pub fn for_each_key(&self, mut f: impl FnMut(&K) -> Result<()>) -> Result<()> {
+    pub fn for_each_key<E: From<UniversalIoError>>(
+        &self,
+        mut f: impl FnMut(&K) -> Result<(), E>,
+    ) -> Result<(), E> {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
         self.for_each_sparse_impl(PartialEntryKind::KeyOnly, offsets.into_iter(), |entry| {
             let PartialEntry::KeyOnly(key) = entry else {
@@ -138,12 +141,12 @@ impl<
         })
     }
 
-    fn for_each_sparse_impl(
+    fn for_each_sparse_impl<E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
         offsets: impl Iterator<Item = u64>,
-        mut f: impl FnMut(PartialEntry<'_, K, V>) -> Result<()>,
-    ) -> Result<()> {
+        mut f: impl FnMut(PartialEntry<'_, K, V>) -> Result<(), E>,
+    ) -> Result<(), E> {
         let expected_read_size = entry_kind.est_size::<K, V>() as u64;
 
         let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
@@ -163,22 +166,21 @@ impl<
             expected_len: u64,
         }
         let mut next_extra_reads = Vec::new();
-        self.reader
-            .read_batch::<Random, _>(reads, |byte_offset, data| {
-                match entry_kind.try_read::<K, V>(data) {
-                    Ok(entry) => f(entry),
-                    Err(expected_len) => {
-                        let mut data_vec = Vec::with_capacity(expected_len as usize);
-                        data_vec.extend_from_slice(data);
-                        next_extra_reads.push(ExtraRead {
-                            data_vec,
-                            byte_offset,
-                            expected_len,
-                        });
-                        Ok(())
-                    }
+        for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, reads)? {
+            let (byte_offset, data) = record?;
+            match entry_kind.try_read::<K, V>(&data) {
+                Ok(entry) => f(entry)?,
+                Err(expected_len) => {
+                    let mut data_vec = Vec::with_capacity(expected_len as usize);
+                    data_vec.extend_from_slice(&data);
+                    next_extra_reads.push(ExtraRead {
+                        data_vec,
+                        byte_offset,
+                        expected_len,
+                    });
                 }
-            })?;
+            }
+        }
 
         while !next_extra_reads.is_empty() {
             let extra_reads = std::mem::take(&mut next_extra_reads)
@@ -190,24 +192,26 @@ impl<
                     };
                     (extra, range.clamp::<u8>(file_len))
                 });
-            self.reader
-                .read_batch::<Random, _>(extra_reads, |mut extra, data| {
-                    extra.data_vec.extend_from_slice(data);
-                    match entry_kind.try_read::<K, V>(&extra.data_vec) {
-                        Ok(entry) => f(entry),
-                        Err(expected_len) => {
-                            extra.expected_len = expected_len;
-                            next_extra_reads.push(extra);
-                            Ok(())
-                        }
+            for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, extra_reads)? {
+                let (mut extra, data) = record?;
+                extra.data_vec.extend_from_slice(&data);
+                match entry_kind.try_read::<K, V>(&extra.data_vec) {
+                    Ok(entry) => f(entry)?,
+                    Err(expected_len) => {
+                        extra.expected_len = expected_len;
+                        next_extra_reads.push(extra);
                     }
-                })?;
+                }
+            }
         }
 
         Ok(())
     }
 
-    pub fn for_each_entry(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
+    pub fn for_each_entry<E: From<UniversalIoError>>(
+        &self,
+        mut f: impl FnMut(&K, &[V]) -> Result<(), E>,
+    ) -> Result<(), E> {
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
         let range = ReadRange {
@@ -221,45 +225,42 @@ impl<
 
         let mut state = State { key_size: None };
 
-        OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
+        let iter = OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
             &self.reader,
             range.iter_autochunks::<u8>().enumerate(),
-        )?)
-        .process_results(|it| -> Result<()> {
-            for (_, mini_buf) in it {
-                buf.extend_from_slice(&mini_buf);
+        )?);
 
-                let mut view: &[u8] = &buf;
-                loop {
-                    match parse_entry(view, &mut state, buf_pos) {
-                        Ok((data, key, values)) => {
-                            f(key, values)?;
-                            view = data;
-                            state.key_size = None;
-                            buf_pos = 0;
-                        }
-                        Err(ReadError::Incomplete) => {
-                            buf_pos = view.len();
-                            break;
-                        }
-                        Err(ReadError::Invalid) => {
-                            return Err(uio_data_err("Failed to parse entry from bytes"));
-                        }
+        for record in iter {
+            let (_, mini_buf) = record?;
+            buf.extend_from_slice(&mini_buf);
+
+            let mut view: &[u8] = &buf;
+            loop {
+                match parse_entry(view, &mut state, buf_pos) {
+                    Ok((data, key, values)) => {
+                        f(key, values)?;
+                        view = data;
+                        state.key_size = None;
+                        buf_pos = 0;
+                    }
+                    Err(ReadError::Incomplete) => {
+                        buf_pos = view.len();
+                        break;
+                    }
+                    Err(ReadError::Invalid) => {
+                        return Err(uio_data_err("Failed to parse entry from bytes").into());
                     }
                 }
-
-                let remaining = view.len();
-                let consumed = buf.len() - remaining;
-                buf.copy_within(consumed.., 0);
-                buf.truncate(remaining);
             }
-            Ok(())
-        })??;
+
+            let remaining = view.len();
+            let consumed = buf.len() - remaining;
+            buf.copy_within(consumed.., 0);
+            buf.truncate(remaining);
+        }
 
         if !buf.is_empty() {
-            return Err(uio_data_err(
-                "Trailing bytes left after parsing all entries",
-            ));
+            return Err(uio_data_err("Trailing bytes left after parsing all entries").into());
         }
 
         Ok(())

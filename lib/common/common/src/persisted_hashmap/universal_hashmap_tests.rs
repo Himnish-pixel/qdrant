@@ -144,8 +144,9 @@ fn test_for_each_entry_impl<K: Key + ?Sized, K1: Ord + Hash + Clone>(
     let (_tmpdir, umap) = write_and_open(&map, &as_ref);
 
     let mut visited: BTreeMap<K1, Vec<u32>> = BTreeMap::new();
-    umap.for_each_entry(|k, vals| {
+    umap.for_each_entry(|k, vals| -> universal_io::Result<()> {
         visited.insert(from_ref(k), vals.to_vec());
+        Ok(())
     })
     .unwrap();
 
@@ -184,7 +185,7 @@ fn test_for_each_key_impl<K: Key + ?Sized, K1: Ord + Hash + Clone + std::fmt::De
     let (_tmpdir, umap) = write_and_open(&map, &as_ref);
 
     let mut keys: BTreeSet<K1> = BTreeSet::new();
-    umap.for_each_key(|k| {
+    umap.for_each_key(|k| -> universal_io::Result<()> {
         keys.insert(from_ref(k));
         Ok(())
     })
@@ -328,10 +329,14 @@ fn test_empty_map() {
     assert!(umap.get_values_count(&0).unwrap().is_none());
 
     let mut count = 0;
-    umap.for_each_entry(|_, _| count += 1).unwrap();
+    umap.for_each_entry(|_, _| -> universal_io::Result<()> {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(count, 0);
 
-    umap.for_each_key(|_: &i64| {
+    umap.for_each_key(|_: &i64| -> universal_io::Result<()> {
         count += 1;
         Ok(())
     })
@@ -361,7 +366,7 @@ fn test_long_string_keys() {
     }
 
     let mut key_count = 0;
-    umap.for_each_key(|_| {
+    umap.for_each_key(|_| -> universal_io::Result<()> {
         key_count += 1;
         Ok(())
     })
@@ -369,9 +374,10 @@ fn test_long_string_keys() {
     assert_eq!(key_count, map.len());
 
     let mut entry_count = 0;
-    umap.for_each_entry(|k, _| {
+    umap.for_each_entry(|k, _| -> universal_io::Result<()> {
         assert!(map.contains_key(k));
         entry_count += 1;
+        Ok(())
     })
     .unwrap();
     assert_eq!(entry_count, map.len());
@@ -388,8 +394,9 @@ fn test_for_each_entry_exceeds_batch_size() {
     let (_tmpdir, umap) = write_and_open::<i64, u32, _>(&map, |k| k);
 
     let mut visited: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
-    umap.for_each_entry(|k, vals| {
+    umap.for_each_entry(|k, vals| -> universal_io::Result<()> {
         visited.insert(*k, vals.to_vec());
+        Ok(())
     })
     .unwrap();
 
