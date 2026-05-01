@@ -139,7 +139,7 @@ impl<
     }
 
     // TODO: drop for_each_entry
-    pub fn for_each_entry_v2(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
+    pub fn for_each_entry(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
         self.for_each_sparse_impl(
             PartialEntryKind::KeyAndValues(32), // TODO
@@ -373,73 +373,6 @@ impl<
             self.batch_read_values(keys, idx_mapping, values_offsets, values_lens, &mut f)?;
 
         Ok(results)
-    }
-
-    // ── Iteration ───────────────────────────────────────────────────────
-
-    /// Iterate over all entries, calling `f` for each `(key, values)` pair.
-    ///
-    /// Reads bucket offsets in bulk, sorts them for sequential access, then reads
-    /// entries in batches of [`ENTRY_BATCH_SIZE`] to bound memory usage.
-    pub fn for_each_entry(&self, mut f: impl FnMut(&K, &[V])) -> Result<()> {
-        let bucket_count = self.header.buckets_count as usize;
-        if bucket_count == 0 {
-            return Ok(());
-        }
-
-        let buckets = self.read_all_bucket_offsets()?;
-        let sorted_offsets = buckets.to_sorted_vec();
-
-        let file_len = UniversalRead::<u8>::len(&self.reader)?;
-        let entries_region_len = file_len - self.entries_start;
-
-        const ENTRY_BATCH_SIZE: usize = 64;
-
-        for chunk_start in (0..sorted_offsets.len()).step_by(ENTRY_BATCH_SIZE) {
-            let chunk_end = (chunk_start + ENTRY_BATCH_SIZE).min(sorted_offsets.len());
-
-            let range_start = sorted_offsets[chunk_start];
-            let range_end = sorted_offsets
-                .get(chunk_end)
-                .copied()
-                .unwrap_or(entries_region_len);
-
-            let chunk_data = self.reader.read::<Sequential>(ReadRange {
-                byte_offset: self.entries_start + range_start,
-                length: range_end - range_start,
-            })?;
-
-            for &offset in &sorted_offsets[chunk_start..chunk_end] {
-                let local_offset = (offset - range_start) as usize;
-                let entry = chunk_data.get(local_offset..).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Entry offset out of bounds")
-                })?;
-
-                let Some(key) = K::from_bytes(entry) else {
-                    debug_assert!(false, "Error reading key");
-                    log::error!("Error reading key");
-                    continue;
-                };
-
-                let key_size_with_padding = Self::key_size_with_padding(key);
-                let values_len = Self::parse_values_len(
-                    entry.get(key_size_with_padding..).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Entry too short for values_len")
-                    })?,
-                )?;
-
-                let values_from = key_size_with_padding + Self::values_len_size_with_padding();
-                let values_to = values_from + values_len as usize * Self::VALUE_SIZE;
-
-                let values_bytes = entry.get(values_from..values_to).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Values region out of bounds")
-                })?;
-
-                Self::with_values(values_bytes, |values| f(key, values))?;
-            }
-        }
-
-        Ok(())
     }
 
     // ── Borrowed iteration ──────────────────────────────────────────────
