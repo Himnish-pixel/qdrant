@@ -138,21 +138,6 @@ impl<
         })
     }
 
-    // TODO: drop for_each_entry
-    pub fn for_each_entry(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
-        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_sparse_impl(
-            PartialEntryKind::KeyAndValues(32), // TODO
-            offsets.into_iter(),
-            |entry| {
-                let PartialEntry::KeyAndValues(key, values) = entry else {
-                    unreachable!()
-                };
-                f(key, values)
-            },
-        )
-    }
-
     fn for_each_sparse_impl(
         &self,
         entry_kind: PartialEntryKind,
@@ -222,7 +207,7 @@ impl<
         Ok(())
     }
 
-    fn for_each_dense_impl(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
+    pub fn for_each_entry(&self, mut f: impl FnMut(&K, &[V]) -> Result<()>) -> Result<()> {
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
         let range = ReadRange {
