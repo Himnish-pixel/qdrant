@@ -180,6 +180,13 @@ impl MmapInvertedIndex {
             }
         };
         let vocab = MmapHashMap::<str, TokenId>::open(&vocab_path, false)?;
+        let vocab2 = UniversalHashMap::<str, TokenId, MmapFile>::open(
+            &vocab_path,
+            OpenOptions {
+                populate: Some(populate),
+                ..OpenOptions::default()
+            },
+        )?;
 
         let point_to_tokens_count = unsafe {
             MmapSlice::try_from(mmap::open_write_mmap(
@@ -211,6 +218,7 @@ impl MmapInvertedIndex {
             storage: Storage {
                 postings,
                 vocab,
+                vocab2,
                 point_to_tokens_count,
                 deleted_points: deleted,
             },
@@ -479,6 +487,7 @@ impl MmapInvertedIndex {
         let Storage {
             postings,
             vocab,
+            vocab2: _,
             point_to_tokens_count,
             deleted_points: _,
         } = storage;
