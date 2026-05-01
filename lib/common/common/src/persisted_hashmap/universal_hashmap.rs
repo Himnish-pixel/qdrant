@@ -74,8 +74,7 @@ impl<
     const VALUES_LEN_SIZE: usize = size_of::<ValuesLen>();
     const VALUE_SIZE: usize = size_of::<V>();
 
-    /// Open the hash map from a file previously created by
-    /// [`MmapHashMap::create`](super::mmap_hashmap::MmapHashMap::create).
+    /// Load the hash map from file.
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let reader: R = UniversalRead::<u8>::open(path, options)?;
 
