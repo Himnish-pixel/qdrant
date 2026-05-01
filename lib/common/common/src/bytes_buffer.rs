@@ -1,9 +1,7 @@
 use std::fmt::Debug;
 
-use bytes::{Buf, BytesMut};
-
 /// Producer-consumer FIFO. Optimized to avoid copying data.
-struct StreamBuffer<T> {
+pub struct StreamBuffer<T> {
     buf: Vec<T>,
     start: usize,
 }
@@ -105,6 +103,7 @@ impl<T: Clone + Debug> StreamBuffer<T> {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use itertools::assert_equal;
     use rand::rngs::StdRng;

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // TODO: remove
+
 use std::borrow::Cow;
 use std::io::{self, Cursor};
 use std::marker::PhantomData;

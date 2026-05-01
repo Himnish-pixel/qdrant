@@ -7,6 +7,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::fs::clear_disk_cache;
 use common::mmap::{self, Advice, AdviceSetting, MmapSlice, create_and_ensure_length};
 use common::persisted_hashmap::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::universal_hashmap::UniversalHashMap;
 use common::stored_bitslice::MmapBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFile, OpenOptions};
@@ -63,6 +64,8 @@ pub struct MmapInvertedIndex {
 pub(in crate::index::field_index::full_text_index) struct Storage {
     pub(in crate::index::field_index::full_text_index) postings: MmapPostingsEnum,
     pub(in crate::index::field_index::full_text_index) vocab: MmapHashMap<str, TokenId>,
+    pub(in crate::index::field_index::full_text_index) vocab2:
+        UniversalHashMap<str, TokenId, MmapFile>,
     pub(in crate::index::field_index::full_text_index) point_to_tokens_count: MmapSlice<usize>,
     pub(in crate::index::field_index::full_text_index) deleted_points: BitVec,
 }
