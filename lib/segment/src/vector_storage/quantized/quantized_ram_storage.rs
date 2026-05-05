@@ -45,12 +45,9 @@ impl QuantizedRamStorage {
 
 impl quantization::EncodedStorage for QuantizedRamStorage {
     fn get_vector_data(&self, offset: impl UniversalOffset) -> Cow<'_, [u8]> {
-        let vectors = self
-            .vectors
-            .get_many(offset.start() as _, offset.count() as _)
-            .unwrap_or_default();
-
-        Cow::Borrowed(vectors)
+        self.vectors
+            .get_many_splice(offset.start() as _, offset.count() as _)
+            .unwrap_or_default()
     }
 
     fn upsert_vector(

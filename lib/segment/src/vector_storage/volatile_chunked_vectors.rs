@@ -1,6 +1,9 @@
-use std::cmp::max;
+use std::borrow::Cow;
+use std::cmp::{self, max};
 use std::collections::TryReserveError;
 use std::mem;
+
+use common::maybe_uninit::assume_init_vec;
 
 use crate::common::vector_utils::{TrySetCapacity, TrySetCapacityExact};
 use crate::vector_storage::VectorOffsetType;
@@ -93,6 +96,45 @@ impl<T: Copy + Clone + Default> VolatileChunkedVectors<T> {
                 let range = idx..idx + count * self.dim;
                 chunk_data.get(range)
             })
+    }
+
+    pub fn get_many_splice(&self, key: VectorOffsetType, count: usize) -> Option<Cow<'_, [T]>> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+
+        let mut buffer = Vec::new();
+        let mut remaining_vectors = count;
+
+        while remaining_vectors > 0 {
+            let offset = key + count - remaining_vectors;
+
+            let chunk_idx = offset / self.chunk_capacity;
+            let chunk = self.chunks.get(chunk_idx)?;
+
+            let vector_idx = offset % self.chunk_capacity;
+            let vectors_to_read = cmp::min(vector_idx + remaining_vectors, self.chunk_capacity);
+
+            let start = vector_idx * self.dim;
+            let end = start + vectors_to_read * self.dim;
+
+            let vectors = chunk.get(start..end)?;
+            remaining_vectors -= vectors_to_read;
+
+            if buffer.is_empty() {
+                if remaining_vectors == 0 {
+                    return Some(Cow::Borrowed(vectors));
+                }
+
+                buffer.reserve(count * self.dim);
+            }
+
+            let offset = buffer.len();
+            buffer.resize(buffer.len() + vectors.len(), mem::MaybeUninit::uninit());
+            buffer[offset..offset + vectors.len()].write_copy_of_slice(vectors);
+        }
+
+        Some(Cow::Owned(unsafe { assume_init_vec(buffer) }))
     }
 
     pub fn push(&mut self, vector: &[T]) -> Result<VectorOffsetType, TryReserveError> {
