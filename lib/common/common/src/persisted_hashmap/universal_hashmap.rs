@@ -7,7 +7,6 @@ use aligned_vec::AVec;
 use ph::fmph::Function;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::bucket_offsets::BucketOffsets;
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
 use crate::persisted_hashmap::keys::{Key, ReadError, ReadResult};
@@ -41,8 +40,7 @@ pub struct UniversalHashMap<
     phf: Function,
     /// Absolute byte offset where entry data begins (right after the bucket offsets array).
     entries_start: u64,
-    _phantom_key: PhantomData<K>,
-    _phantom_value: PhantomData<V>,
+    phantom: PhantomData<(V, K)>,
 }
 
 impl<
@@ -97,8 +95,7 @@ impl<
             header,
             phf,
             entries_start,
-            _phantom_key: PhantomData,
-            _phantom_value: PhantomData,
+            phantom: PhantomData,
         })
     }
 
@@ -114,7 +111,16 @@ impl<
     where
         K: PartialEq,
     {
-        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
+        let bucket_count = self.header.buckets_count as usize;
+        let bytes = self.reader.read::<Sequential>(ReadRange {
+            byte_offset: self.header.buckets_pos,
+            length: (bucket_count * size_of::<BucketOffset>()) as u64,
+        })?;
+        let mut offsets: Vec<BucketOffset> = bytes
+            .chunks_exact(size_of::<BucketOffset>())
+            .map(|c| BucketOffset::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        offsets.sort_unstable();
         self.for_each_sparse(
             PartialEntryKind::KeyOnly,
             offsets.into_iter().map(|o| ((), Request::Offset(o))),
@@ -309,16 +315,6 @@ impl<
 
         let values_len = Self::parse_values_len(&entry_header[key_size_with_padding..])?;
         Ok(Some((entry_start, header_size, values_len)))
-    }
-
-    /// Read all bucket offsets in one sequential IO.
-    fn read_all_bucket_offsets(&self) -> Result<BucketOffsets<'_>> {
-        let bucket_count = self.header.buckets_count as usize;
-        let bytes = self.reader.read::<Sequential>(ReadRange {
-            byte_offset: self.header.buckets_pos,
-            length: (bucket_count * size_of::<BucketOffset>()) as u64,
-        })?;
-        Ok(BucketOffsets::new(bytes))
     }
 
     fn read_bucket_offset(&self, index: usize) -> Result<u64> {
