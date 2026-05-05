@@ -368,14 +368,14 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
 
         match self.storage.value_to_points.get(value) {
-            Ok(Some(iter)) => {
+            Ok(Some(values)) => {
                 // We're iterating over the whole (mmapped) slice
                 hw_counter
                     .payload_index_io_read_counter()
                     .incr_delta(size_of::<PointOffsetType>() + READ_ENTRY_OVERHEAD);
 
                 Box::new(
-                    iter.map(|idx| idx.unwrap()).filter(|idx| {
+                    values.into_iter().filter(|idx| {
                         !self.storage.deleted.get_bit(*idx as usize).unwrap_or(false)
                     }),
                 )
