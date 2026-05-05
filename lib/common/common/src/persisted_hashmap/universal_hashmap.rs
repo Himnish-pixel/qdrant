@@ -410,8 +410,12 @@ where
         E: From<UniversalIoError>,
         Cb: FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
     {
+        let range;
         if let Some(entry) = self.to_schedule.pop() {
-            let range = match &entry.state {
+            match &entry.state {
+                EntryState::LocatingOffset { .. } => {
+                    unreachable!("only Loading entries are queued in to_schedule")
+                }
                 EntryState::Loading {
                     byte_offset,
                     data_vec,
@@ -419,19 +423,17 @@ where
                     requested_key: _,
                 } => {
                     let already = data_vec.len() as u64;
-                    ReadRange {
+                    range = ReadRange {
                         byte_offset: *byte_offset + already,
                         length: *expected_len - already,
                     }
                 }
-                _ => unreachable!("only Loading entries are queued in to_schedule"),
             };
             return Ok(Some((entry, range.clamp::<u8>(self.file_len))));
         }
-        // Pull from `requests`, skipping over PHF misses.
+
         while let Some((meta, request)) = requests.next() {
             let entry;
-            let range;
             match request {
                 Request::Offset(offset) => {
                     // Offset request: location is known, jump straight to Loading.
