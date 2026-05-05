@@ -63,8 +63,7 @@ pub struct MmapInvertedIndex {
 
 pub(in crate::index::field_index::full_text_index) struct Storage {
     pub(in crate::index::field_index::full_text_index) postings: MmapPostingsEnum,
-    pub(in crate::index::field_index::full_text_index) vocab: MmapHashMap<str, TokenId>,
-    pub(in crate::index::field_index::full_text_index) vocab2:
+    pub(in crate::index::field_index::full_text_index) vocab:
         UniversalHashMap<str, TokenId, MmapFile>,
     pub(in crate::index::field_index::full_text_index) point_to_tokens_count: MmapSlice<usize>,
     pub(in crate::index::field_index::full_text_index) deleted_points: BitVec,
@@ -75,7 +74,6 @@ impl Storage {
         let Self {
             postings: _,
             vocab: _,
-            vocab2: _,
             point_to_tokens_count: _,
             deleted_points,
         } = self;
@@ -180,8 +178,7 @@ impl MmapInvertedIndex {
                 )?)
             }
         };
-        let vocab = MmapHashMap::<str, TokenId>::open(&vocab_path, false)?;
-        let vocab2 = UniversalHashMap::<str, TokenId, MmapFile>::open(
+        let vocab = UniversalHashMap::<str, TokenId, MmapFile>::open(
             &vocab_path,
             OpenOptions {
                 populate: Some(populate),
@@ -219,7 +216,6 @@ impl MmapInvertedIndex {
             storage: Storage {
                 postings,
                 vocab,
-                vocab2,
                 point_to_tokens_count,
                 deleted_points: deleted,
             },
@@ -232,7 +228,7 @@ impl MmapInvertedIndex {
         &self,
         mut f: impl FnMut(&str, TokenId) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        self.storage.vocab.iter().try_for_each(|(k, v)| {
+        self.storage.vocab.for_each_entry(|k, v| {
             // unwrap safety: we know that each token points to a token id.
             f(k, *v.first().unwrap())
         })
@@ -474,7 +470,7 @@ impl MmapInvertedIndex {
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
         self.storage.postings.populate()?;
-        self.storage.vocab2.populate()?;
+        self.storage.vocab.populate()?;
         self.storage.point_to_tokens_count.populate()?;
         Ok(())
     }
@@ -489,13 +485,12 @@ impl MmapInvertedIndex {
         } = self;
         let Storage {
             postings,
-            vocab: _,
-            vocab2,
+            vocab,
             point_to_tokens_count,
             deleted_points: _,
         } = storage;
         postings.clear_cache()?;
-        vocab2.clear_ram_cache()?;
+        vocab.clear_ram_cache()?;
         point_to_tokens_count.clear_cache()?;
         clear_disk_cache(&path.join(DELETED_POINTS_FILE))?;
         Ok(())
@@ -640,13 +635,12 @@ impl InvertedIndex for MmapInvertedIndex {
                 READ_ENTRY_OVERHEAD + size_of::<TokenId>(), // Avoid check overhead and assume token is always read
             );
         }
-        self.storage.vocab2.batch_with_entry(
-            tokens,
-            |meta, token_ids| match token_ids {
+        self.storage
+            .vocab
+            .batch_with_entry(tokens, |meta, token_ids| match token_ids {
                 Some([token_id]) => Ok(f(meta, Some(*token_id))),
                 Some(_) => unreachable!(),
                 None => Ok(f(meta, None)),
-            },
-        )
+            })
     }
 }
