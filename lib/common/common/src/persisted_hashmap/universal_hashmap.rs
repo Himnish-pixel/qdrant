@@ -290,7 +290,7 @@ impl<
                             byte_offset,
                             data_vec,
                             expected_len,
-                            ..
+                            requested_key: _,
                         } => {
                             let already = data_vec.len() as u64;
                             ReadRange {
@@ -357,11 +357,7 @@ impl<
             match entry.state {
                 EntryState::LocatingOffset { requested_key } => {
                     // Bucket-offset arrived: parse it, queue the entry for Loading.
-                    let entry_offset = BucketOffset::from_ne_bytes(
-                        data[..]
-                            .try_into()
-                            .map_err(|_| uio_data_err("Can't read bucket offset"))?,
-                    );
+                    let entry_offset = parse_entry_offset(&data)?;
                     to_schedule.push(Entry {
                         meta: entry.meta,
                         state: EntryState::Loading {
@@ -375,8 +371,8 @@ impl<
                 EntryState::Loading {
                     byte_offset,
                     mut data_vec,
+                    expected_len: _,
                     requested_key,
-                    ..
                 } => {
                     data_vec.extend_from_slice(&data);
 
@@ -614,6 +610,13 @@ impl<
 
 fn uio_data_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> UniversalIoError {
     UniversalIoError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
+}
+
+fn parse_entry_offset(data: &[u8]) -> Result<BucketOffset> {
+    Ok(BucketOffset::from_ne_bytes(
+        data.try_into()
+            .map_err(|_| uio_data_err("Can't read bucket offset"))?,
+    ))
 }
 
 enum Request<'a, K: Key + ?Sized> {
