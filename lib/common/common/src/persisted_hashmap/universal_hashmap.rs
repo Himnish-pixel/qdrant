@@ -1,6 +1,3 @@
-// TODO: drop UniversalRead<V>
-// TODO: drop `get`
-
 use std::io::{self, Cursor};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -37,7 +34,7 @@ pub const READ_ENTRY_OVERHEAD: usize = super::mmap_hashmap::READ_ENTRY_OVERHEAD;
 pub struct UniversalHashMap<
     K: ?Sized,
     V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
-    R: UniversalRead<u8> + UniversalRead<V>,
+    R: UniversalRead<u8>,
 > {
     reader: R,
     header: Header,
@@ -51,7 +48,7 @@ pub struct UniversalHashMap<
 impl<
     K: Key + ?Sized,
     V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
-    R: UniversalRead<u8> + UniversalRead<V>,
+    R: UniversalRead<u8>,
 > UniversalHashMap<K, V, R>
 {
     const VALUES_LEN_SIZE: usize = size_of::<ValuesLen>();
@@ -59,7 +56,7 @@ impl<
 
     /// Load the hash map from file.
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let reader: R = UniversalRead::<u8>::open(path, options)?;
+        let reader = R::open(path, options)?;
 
         // 1. Read header.
         let header_bytes = reader.read::<Sequential>(ReadRange {
@@ -118,7 +115,7 @@ impl<
         K: PartialEq,
     {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_sparse_impl2(
+        self.for_each_sparse(
             PartialEntryKind::KeyOnly,
             offsets.into_iter().map(|o| ((), Request::Offset(o))),
             |(), entry| {
@@ -138,7 +135,7 @@ impl<
     where
         K: 'k + PartialEq,
     {
-        self.for_each_sparse_impl2(
+        self.for_each_sparse(
             PartialEntryKind::KeyAndValues(1),
             keys.into_iter()
                 .map(|(meta, key)| (meta, Request::Key(key))),
@@ -154,7 +151,7 @@ impl<
         )
     }
 
-    fn for_each_sparse_impl2<'a, Meta, E: From<UniversalIoError>>(
+    fn for_each_sparse<'a, Meta, E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
         requests: impl Iterator<Item = (Meta, Request<'a, K>)>,
@@ -164,7 +161,7 @@ impl<
         K: 'a + PartialEq,
     {
         let mut sparse = SparsePipeline::new(self, entry_kind)?;
-        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Entry<'a, Meta, K>>::new()?;
+        let mut pipeline = R::ReadPipeline::<'_, Entry<'a, Meta, K>>::new()?;
         let mut requests = requests.into_iter();
         loop {
             while pipeline.can_schedule() {
@@ -246,7 +243,7 @@ impl<
         K: PartialEq,
     {
         let mut result: Option<Vec<V>> = None;
-        self.for_each_sparse_impl2(
+        self.for_each_sparse(
             PartialEntryKind::KeyAndValues(1),
             std::iter::once(((), Request::Key(key))),
             |(), entry| -> Result<()> {
@@ -371,7 +368,7 @@ struct SparsePipeline<'m, 'k, Meta, K, V, R>
 where
     K: Key + ?Sized + 'k,
     V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
-    R: UniversalRead<u8> + UniversalRead<V>,
+    R: UniversalRead<u8>,
 {
     map: &'m UniversalHashMap<K, V, R>,
     entry_kind: PartialEntryKind,
@@ -386,7 +383,7 @@ impl<'m, 'k, Meta, K, V, R> SparsePipeline<'m, 'k, Meta, K, V, R>
 where
     K: Key + ?Sized + 'k + PartialEq,
     V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
-    R: UniversalRead<u8> + UniversalRead<V>,
+    R: UniversalRead<u8>,
 {
     fn new(map: &'m UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
         let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
