@@ -256,7 +256,9 @@ impl<
         enum EntryState<'a, K: Key + ?Sized> {
             // Waiting for the bucket-offset value (8 bytes) so we can locate the
             // entry data on disk. Only used for `Request::Key`.
-            LocatingOffset { requested_key: &'a K },
+            LocatingOffset {
+                requested_key: &'a K,
+            },
             // Reading the entry data. May span multiple I/Os if the entry is
             // larger than the initial size estimate.
             //
@@ -271,8 +273,7 @@ impl<
             },
         }
 
-        let mut pipeline =
-            <R as UniversalRead<u8>>::ReadPipeline::<'_, Entry<'_, Meta, K>>::new()?;
+        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Entry<'_, Meta, K>>::new()?;
         let mut requests = requests.into_iter();
         // Entries waiting for an I/O slot. Filled when we transition into
         // Loading or need a follow-up read for partially-loaded data.
@@ -356,8 +357,11 @@ impl<
             match entry.state {
                 EntryState::LocatingOffset { requested_key } => {
                     // Bucket-offset arrived: parse it, queue the entry for Loading.
-                    let (entry_offset, _) = BucketOffset::read_from_prefix(&data)
-                        .map_err(|_| uio_data_err("Can't read bucket offset"))?;
+                    let entry_offset = BucketOffset::from_ne_bytes(
+                        data[..]
+                            .try_into()
+                            .map_err(|_| uio_data_err("Can't read bucket offset"))?,
+                    );
                     to_schedule.push(Entry {
                         meta: entry.meta,
                         state: EntryState::Loading {
