@@ -240,173 +240,14 @@ impl<
     where
         K: 'a + PartialEq,
     {
-        let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
-        let file_len = UniversalRead::<u8>::len(&self.reader)?;
-
-        struct Entry<'a, Meta, K: Key + ?Sized> {
-            meta: Meta,
-            state: EntryState<'a, K>,
-        }
-
-        // Lifecycle:
-        //   Request::Offset → Loading                          (offset already known)
-        //   Request::Key    → LocatingOffset → Loading         (resolve via bucket pointer)
-        //   Loading         → Loading (with larger expected_len, if a follow-up is needed)
-        //   Loading         → done (try_read Ok or key mismatch)
-        enum EntryState<'a, K: Key + ?Sized> {
-            // Waiting for the bucket-offset value (8 bytes) so we can locate the
-            // entry data on disk. Only used for `Request::Key`.
-            LocatingOffset {
-                requested_key: &'a K,
-            },
-            // Reading the entry data. May span multiple I/Os if the entry is
-            // larger than the initial size estimate.
-            //
-            // `requested_key` stays `Some` while we still need to verify the
-            // stored key matches; gets cleared once verified, and is `None` for
-            // offset requests.
-            Loading {
-                byte_offset: u64,
-                data_vec: Vec<u8>,
-                expected_len: u64,
-                requested_key: Option<&'a K>,
-            },
-        }
-
-        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Entry<'_, Meta, K>>::new()?;
+        let mut pipeline = SparsePipeline::new(self, entry_kind)?;
         let mut requests = requests.into_iter();
-        // Entries waiting for an I/O slot. Filled when we transition into
-        // Loading or need a follow-up read for partially-loaded data.
-        let mut to_schedule: Vec<Entry<'_, Meta, K>> = Vec::new();
-
         loop {
-            // Refill the pipeline.
-            while pipeline.can_schedule() {
-                let next_entry;
-                let range;
-                if let Some(entry) = to_schedule.pop() {
-                    range = match &entry.state {
-                        EntryState::Loading {
-                            byte_offset,
-                            data_vec,
-                            expected_len,
-                            requested_key: _,
-                        } => {
-                            let already = data_vec.len() as u64;
-                            ReadRange {
-                                byte_offset: *byte_offset + already,
-                                length: *expected_len - already,
-                            }
-                        }
-                        _ => unreachable!("only Loading entries are queued in to_schedule"),
-                    };
-                    next_entry = entry;
-                } else if let Some((meta, request)) = requests.next() {
-                    match request {
-                        Request::Offset(offset) => {
-                            // Offset request: location is known, jump straight to Loading.
-                            let byte_offset = self.entries_start + offset;
-                            range = ReadRange {
-                                byte_offset,
-                                length: entry_read_size_est,
-                            };
-                            next_entry = Entry {
-                                meta,
-                                state: EntryState::Loading {
-                                    byte_offset,
-                                    data_vec: Vec::new(),
-                                    expected_len: entry_read_size_est,
-                                    requested_key: None,
-                                },
-                            };
-                        }
-                        Request::Key(key) => {
-                            // PHF miss: no stored entry; report immediately and skip the read.
-                            let Some(hash) = self.phf.get(key) else {
-                                f(meta, None)?;
-                                continue;
-                            };
-                            // PHF hit: schedule the bucket-offset read; transitions to
-                            // Loading once the offset arrives.
-                            let bucket_byte_offset =
-                                self.header.buckets_pos + hash * size_of::<BucketOffset>() as u64;
-                            range = ReadRange {
-                                byte_offset: bucket_byte_offset,
-                                length: size_of::<BucketOffset>() as u64,
-                            };
-                            next_entry = Entry {
-                                meta,
-                                state: EntryState::LocatingOffset { requested_key: key },
-                            };
-                        }
-                    }
-                } else {
-                    break;
-                }
-                pipeline.schedule::<Random>(
-                    next_entry,
-                    &self.reader,
-                    range.clamp::<u8>(file_len),
-                )?;
-            }
-
-            let Some((entry, data)) = pipeline.wait()? else {
+            pipeline.refill(&mut requests, &mut f)?;
+            if !pipeline.process_one(&mut f)? {
                 break;
-            };
-
-            match entry.state {
-                EntryState::LocatingOffset { requested_key } => {
-                    // Bucket-offset arrived: parse it, queue the entry for Loading.
-                    let entry_offset = parse_entry_offset(&data)?;
-                    to_schedule.push(Entry {
-                        meta: entry.meta,
-                        state: EntryState::Loading {
-                            byte_offset: self.entries_start + entry_offset,
-                            data_vec: Vec::new(),
-                            expected_len: entry_read_size_est,
-                            requested_key: Some(requested_key),
-                        },
-                    });
-                }
-                EntryState::Loading {
-                    byte_offset,
-                    mut data_vec,
-                    expected_len: _,
-                    requested_key,
-                } => {
-                    data_vec.extend_from_slice(&data);
-
-                    // For key requests, verify the stored key as soon as it's parseable.
-                    let mut unverified_key = requested_key;
-                    if let Some(req_key) = requested_key {
-                        if let Some(stored_key) = K::from_bytes(&data_vec) {
-                            if req_key != stored_key {
-                                // Mismatch → no entry to return; skip further reads.
-                                f(entry.meta, None)?;
-                                continue;
-                            }
-                            // Match → no need to re-check on subsequent follow-up reads.
-                            unverified_key = None;
-                        }
-                    }
-
-                    match entry_kind.try_read::<K, V>(&data_vec) {
-                        Ok(parsed) => f(entry.meta, Some(parsed))?,
-                        // Need more bytes: requeue with the new expected length.
-                        Err(expected_len) => to_schedule.push(Entry {
-                            meta: entry.meta,
-                            state: EntryState::Loading {
-                                byte_offset,
-                                data_vec,
-                                expected_len,
-                                requested_key: unverified_key,
-                            },
-                        }),
-                    }
-                }
             }
         }
-
         Ok(())
     }
 
@@ -617,6 +458,223 @@ fn parse_entry_offset(data: &[u8]) -> Result<BucketOffset> {
         data.try_into()
             .map_err(|_| uio_data_err("Can't read bucket offset"))?,
     ))
+}
+
+/// Driver for [`UniversalHashMap::for_each_sparse_impl2`]. Owns the I/O pipeline
+/// and the queue of entries waiting for an I/O slot, and exposes the two halves
+/// of the loop: [`refill`](Self::refill) and [`process_one`](Self::process_one).
+struct SparsePipeline<'m, 'k, Meta, K, V, R>
+where
+    K: Key + ?Sized + 'k,
+    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    R: UniversalRead<u8> + UniversalRead<V> + 'm,
+{
+    map: &'m UniversalHashMap<K, V, R>,
+    entry_kind: PartialEntryKind,
+    pipeline: <R as UniversalRead<u8>>::ReadPipeline<'m, Entry<'k, Meta, K>>,
+    // Entries with a Loading-phase read ready to be scheduled. Filled when we
+    // transition into Loading or need a follow-up read for partially-loaded data.
+    to_schedule: Vec<Entry<'k, Meta, K>>,
+    entry_read_size_est: u64,
+    file_len: u64,
+}
+
+impl<'m, 'k, Meta, K, V, R> SparsePipeline<'m, 'k, Meta, K, V, R>
+where
+    K: Key + ?Sized + 'k + PartialEq,
+    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    R: UniversalRead<u8> + UniversalRead<V> + 'm,
+{
+    fn new(map: &'m UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
+        let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
+        let file_len = UniversalRead::<u8>::len(&map.reader)?;
+        let pipeline =
+            <R as UniversalRead<u8>>::ReadPipeline::<'m, Entry<'k, Meta, K>>::new()?;
+        Ok(Self {
+            map,
+            entry_kind,
+            pipeline,
+            to_schedule: Vec::new(),
+            entry_read_size_est,
+            file_len,
+        })
+    }
+
+    /// Schedule reads until the pipeline is full or both `to_schedule` and
+    /// `requests` are exhausted. PHF misses are reported via `callback` without
+    /// scheduling any I/O.
+    fn refill<E, Cb>(
+        &mut self,
+        requests: &mut impl Iterator<Item = (Meta, Request<'k, K>)>,
+        callback: &mut Cb,
+    ) -> Result<(), E>
+    where
+        E: From<UniversalIoError>,
+        Cb: FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
+    {
+        while self.pipeline.can_schedule() {
+            let next_entry;
+            let range;
+            if let Some(entry) = self.to_schedule.pop() {
+                range = match &entry.state {
+                    EntryState::Loading {
+                        byte_offset,
+                        data_vec,
+                        expected_len,
+                        requested_key: _,
+                    } => {
+                        let already = data_vec.len() as u64;
+                        ReadRange {
+                            byte_offset: *byte_offset + already,
+                            length: *expected_len - already,
+                        }
+                    }
+                    _ => unreachable!("only Loading entries are queued in to_schedule"),
+                };
+                next_entry = entry;
+            } else if let Some((meta, request)) = requests.next() {
+                match request {
+                    Request::Offset(offset) => {
+                        // Offset request: location is known, jump straight to Loading.
+                        let byte_offset = self.map.entries_start + offset;
+                        range = ReadRange {
+                            byte_offset,
+                            length: self.entry_read_size_est,
+                        };
+                        next_entry = Entry {
+                            meta,
+                            state: EntryState::Loading {
+                                byte_offset,
+                                data_vec: Vec::new(),
+                                expected_len: self.entry_read_size_est,
+                                requested_key: None,
+                            },
+                        };
+                    }
+                    Request::Key(key) => {
+                        // PHF miss: no stored entry; report immediately and skip the read.
+                        let Some(hash) = self.map.phf.get(key) else {
+                            callback(meta, None)?;
+                            continue;
+                        };
+                        // PHF hit: schedule the bucket-offset read; transitions to
+                        // Loading once the offset arrives.
+                        let bucket_byte_offset = self.map.header.buckets_pos
+                            + hash * size_of::<BucketOffset>() as u64;
+                        range = ReadRange {
+                            byte_offset: bucket_byte_offset,
+                            length: size_of::<BucketOffset>() as u64,
+                        };
+                        next_entry = Entry {
+                            meta,
+                            state: EntryState::LocatingOffset { requested_key: key },
+                        };
+                    }
+                }
+            } else {
+                break;
+            }
+            self.pipeline.schedule::<Random>(
+                next_entry,
+                &self.map.reader,
+                range.clamp::<u8>(self.file_len),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Wait for one read to complete and process its result. Returns `Ok(false)`
+    /// once the pipeline has no outstanding reads.
+    fn process_one<E, Cb>(&mut self, callback: &mut Cb) -> Result<bool, E>
+    where
+        E: From<UniversalIoError>,
+        Cb: FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
+    {
+        let Some((entry, data)) = self.pipeline.wait()? else {
+            return Ok(false);
+        };
+
+        match entry.state {
+            EntryState::LocatingOffset { requested_key } => {
+                // Bucket-offset arrived: parse it, queue the entry for Loading.
+                let entry_offset = parse_entry_offset(&data)?;
+                self.to_schedule.push(Entry {
+                    meta: entry.meta,
+                    state: EntryState::Loading {
+                        byte_offset: self.map.entries_start + entry_offset,
+                        data_vec: Vec::new(),
+                        expected_len: self.entry_read_size_est,
+                        requested_key: Some(requested_key),
+                    },
+                });
+            }
+            EntryState::Loading {
+                byte_offset,
+                mut data_vec,
+                expected_len: _,
+                requested_key,
+            } => {
+                data_vec.extend_from_slice(&data);
+
+                // For key requests, verify the stored key as soon as it's parseable.
+                let mut unverified_key = requested_key;
+                if let Some(req_key) = requested_key {
+                    if let Some(stored_key) = K::from_bytes(&data_vec) {
+                        if req_key != stored_key {
+                            // Mismatch → no entry to return; skip further reads.
+                            callback(entry.meta, None)?;
+                            return Ok(true);
+                        }
+                        // Match → no need to re-check on subsequent follow-up reads.
+                        unverified_key = None;
+                    }
+                }
+
+                match self.entry_kind.try_read::<K, V>(&data_vec) {
+                    Ok(parsed) => callback(entry.meta, Some(parsed))?,
+                    // Need more bytes: requeue with the new expected length.
+                    Err(expected_len) => self.to_schedule.push(Entry {
+                        meta: entry.meta,
+                        state: EntryState::Loading {
+                            byte_offset,
+                            data_vec,
+                            expected_len,
+                            requested_key: unverified_key,
+                        },
+                    }),
+                }
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+struct Entry<'a, Meta, K: Key + ?Sized> {
+    meta: Meta,
+    state: EntryState<'a, K>,
+}
+
+// Lifecycle:
+//   Request::Offset → Loading                  (offset already known)
+//   Request::Key    → LocatingOffset → Loading (resolve via bucket pointer)
+//   Loading         → Loading                  (with larger expected_len, on follow-up)
+//   Loading         → done                     (try_read Ok or key mismatch)
+enum EntryState<'a, K: Key + ?Sized> {
+    // Waiting for the bucket-offset value (8 bytes) so we can locate the entry
+    // data on disk. Only used for `Request::Key`.
+    LocatingOffset { requested_key: &'a K },
+    // Reading the entry data. May span multiple I/Os if the entry is larger
+    // than the initial size estimate.
+    //
+    // `requested_key` stays `Some` while we still need to verify the stored
+    // key matches; gets cleared once verified, and is `None` for offset requests.
+    Loading {
+        byte_offset: u64,
+        data_vec: Vec<u8>,
+        expected_len: u64,
+        requested_key: Option<&'a K>,
+    },
 }
 
 enum Request<'a, K: Key + ?Sized> {
