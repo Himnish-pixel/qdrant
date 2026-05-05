@@ -16,15 +16,16 @@ pub type ReadResult<T> = Result<T, ReadError>;
 pub trait Key: Sync + Hash {
     const ALIGN: usize;
 
+    /// Stored in the file header.
+    /// TODO: rename to `NAME_MAGIC`
     const NAME: [u8; 8];
 
-    /// Reasonable guess size of the key when performing random read
+    /// Reasonable guess size of the key when performing random read.
+    /// Exact size for fixed-size keys, some arbitrary length for string keys.
     const VALUE_SIZE_EST: usize;
 
     /// Returns number of bytes which `write` will write.
     fn write_bytes(&self) -> usize;
-
-    fn size_from_raw(buf: impl Iterator<Item = u8>) -> Option<usize>;
 
     /// Write the key to `buf`.
     fn write(&self, buf: &mut impl Write) -> io::Result<()>;
@@ -42,23 +43,17 @@ pub trait Key: Sync + Hash {
     /// new data appended to `buf`. New bytes are `buf[prev_size..]`. On first
     /// invocation, `prev_size` is 0.
     fn from_bytes_streaming(buf: &[u8], prev_size: usize) -> ReadResult<&Self>;
-
-    fn fixed_size() -> Option<u64>;
 }
 
 impl Key for str {
     const ALIGN: usize = align_of::<u8>();
 
-    const VALUE_SIZE_EST: usize = 512; // A guess.
+    const VALUE_SIZE_EST: usize = 512;
 
     const NAME: [u8; 8] = *b"str\0\0\0\0\0";
 
     fn write_bytes(&self) -> usize {
         self.len() + 1
-    }
-
-    fn size_from_raw(mut bytes: impl Iterator<Item = u8>) -> Option<usize> {
-        bytes.position(|b| b == 0xFF)
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -108,10 +103,6 @@ impl Key for str {
         };
         str::from_utf8(&buf[..prev_size + sentinel_pos]).map_err(|_| ReadError::Invalid)
     }
-
-    fn fixed_size() -> Option<u64> {
-        None
-    }
 }
 
 impl Key for i64 {
@@ -123,10 +114,6 @@ impl Key for i64 {
 
     fn write_bytes(&self) -> usize {
         Self::VALUE_SIZE_EST
-    }
-
-    fn size_from_raw(_: impl Iterator<Item = u8>) -> Option<usize> {
-        Some(Self::VALUE_SIZE_EST)
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -144,10 +131,6 @@ impl Key for i64 {
     fn from_bytes_streaming(buf: &[u8], _prev_size: usize) -> ReadResult<&Self> {
         Ok(Self::ref_from_prefix(buf)?.0)
     }
-
-    fn fixed_size() -> Option<u64> {
-        Some(size_of::<i64>() as u64)
-    }
 }
 
 impl Key for u128 {
@@ -159,10 +142,6 @@ impl Key for u128 {
 
     fn write_bytes(&self) -> usize {
         Self::VALUE_SIZE_EST
-    }
-
-    fn size_from_raw(_: impl Iterator<Item = u8>) -> Option<usize> {
-        Some(Self::VALUE_SIZE_EST)
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -186,10 +165,6 @@ impl Key for u128 {
 
     fn from_bytes_streaming(buf: &[u8], _prev_size: usize) -> ReadResult<&Self> {
         Ok(Self::ref_from_prefix(buf)?.0)
-    }
-
-    fn fixed_size() -> Option<u64> {
-        Some(size_of::<u128>() as u64)
     }
 }
 
