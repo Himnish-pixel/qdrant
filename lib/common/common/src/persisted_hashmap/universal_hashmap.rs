@@ -234,90 +234,108 @@ impl<
     fn for_each_sparse_impl2<'a, Meta, E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
-        offsets: impl Iterator<Item = (Meta, Request<'a, K>)>,
+        requests: impl Iterator<Item = (Meta, Request<'a, K>)>,
         mut f: impl FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
     ) -> Result<(), E>
     where
         K: 'a + PartialEq,
     {
-        let expected_read_size = entry_kind.est_size::<K, V>() as u64;
+        let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
-        struct Pending<'a, Meta, K: Key + ?Sized> {
+        struct Entry<'a, Meta, K: Key + ?Sized> {
             meta: Meta,
-            phase: Phase<'a, K>,
+            state: EntryState<'a, K>,
         }
 
-        enum Phase<'a, K: Key + ?Sized> {
-            // Reading the bucket offset value (8 bytes); resolved offset starts the Entry phase.
-            BucketOffset {
-                requested_key: &'a K,
-            },
-            // Reading the entry data. `requested_key` is `Some` while we still need to verify
-            // the stored key matches; `None` once verified or for offset requests.
-            Entry {
+        // Lifecycle:
+        //   Request::Offset → Loading                          (offset already known)
+        //   Request::Key    → LocatingOffset → Loading         (resolve via bucket pointer)
+        //   Loading         → Loading (with larger expected_len, if a follow-up is needed)
+        //   Loading         → done (try_read Ok or key mismatch)
+        enum EntryState<'a, K: Key + ?Sized> {
+            // Waiting for the bucket-offset value (8 bytes) so we can locate the
+            // entry data on disk. Only used for `Request::Key`.
+            LocatingOffset { requested_key: &'a K },
+            // Reading the entry data. May span multiple I/Os if the entry is
+            // larger than the initial size estimate.
+            //
+            // `requested_key` stays `Some` while we still need to verify the
+            // stored key matches; gets cleared once verified, and is `None` for
+            // offset requests.
+            Loading {
                 byte_offset: u64,
                 data_vec: Vec<u8>,
+                expected_len: u64,
                 requested_key: Option<&'a K>,
             },
         }
 
         let mut pipeline =
-            <R as UniversalRead<u8>>::ReadPipeline::<'_, Pending<'_, Meta, K>>::new()?;
-        let mut offsets = offsets.into_iter();
-        let mut followups: Vec<(Pending<'_, Meta, K>, u64)> = Vec::new();
+            <R as UniversalRead<u8>>::ReadPipeline::<'_, Entry<'_, Meta, K>>::new()?;
+        let mut requests = requests.into_iter();
+        // Entries waiting for an I/O slot. Filled when we transition into
+        // Loading or need a follow-up read for partially-loaded data.
+        let mut to_schedule: Vec<Entry<'_, Meta, K>> = Vec::new();
 
         loop {
             // Refill the pipeline.
             while pipeline.can_schedule() {
-                let next_pending;
+                let next_entry;
                 let range;
-                if let Some((pending, expected_len)) = followups.pop() {
-                    let Phase::Entry {
-                        byte_offset,
-                        ref data_vec,
-                        ..
-                    } = pending.phase
-                    else {
-                        unreachable!("followup must be in Entry phase");
+                if let Some(entry) = to_schedule.pop() {
+                    range = match &entry.state {
+                        EntryState::Loading {
+                            byte_offset,
+                            data_vec,
+                            expected_len,
+                            ..
+                        } => {
+                            let already = data_vec.len() as u64;
+                            ReadRange {
+                                byte_offset: *byte_offset + already,
+                                length: *expected_len - already,
+                            }
+                        }
+                        _ => unreachable!("only Loading entries are queued in to_schedule"),
                     };
-                    let already = data_vec.len() as u64;
-                    range = ReadRange {
-                        byte_offset: byte_offset + already,
-                        length: expected_len - already,
-                    };
-                    next_pending = pending;
-                } else if let Some((meta, request)) = offsets.next() {
+                    next_entry = entry;
+                } else if let Some((meta, request)) = requests.next() {
                     match request {
                         Request::Offset(offset) => {
+                            // Offset request: location is known, jump straight to Loading.
                             let byte_offset = self.entries_start + offset;
                             range = ReadRange {
                                 byte_offset,
-                                length: expected_read_size,
+                                length: entry_read_size_est,
                             };
-                            next_pending = Pending {
+                            next_entry = Entry {
                                 meta,
-                                phase: Phase::Entry {
+                                state: EntryState::Loading {
                                     byte_offset,
                                     data_vec: Vec::new(),
+                                    expected_len: entry_read_size_est,
                                     requested_key: None,
                                 },
                             };
                         }
                         Request::Key(key) => {
+                            // PHF miss: no stored entry; report immediately and skip the read.
                             let Some(hash) = self.phf.get(key) else {
                                 f(meta, None)?;
                                 continue;
                             };
+                            // PHF hit: schedule the bucket-offset read; transitions to
+                            // Loading once the offset arrives.
                             let bucket_byte_offset =
                                 self.header.buckets_pos + hash * size_of::<BucketOffset>() as u64;
                             range = ReadRange {
                                 byte_offset: bucket_byte_offset,
                                 length: size_of::<BucketOffset>() as u64,
                             };
-                            next_pending = Pending {
+                            next_entry = Entry {
                                 meta,
-                                phase: Phase::BucketOffset { requested_key: key },
+                                state: EntryState::LocatingOffset { requested_key: key },
                             };
                         }
                     }
@@ -325,64 +343,65 @@ impl<
                     break;
                 }
                 pipeline.schedule::<Random>(
-                    next_pending,
+                    next_entry,
                     &self.reader,
                     range.clamp::<u8>(file_len),
                 )?;
             }
 
-            let Some((pending, data)) = pipeline.wait()? else {
+            let Some((entry, data)) = pipeline.wait()? else {
                 break;
             };
 
-            match pending.phase {
-                Phase::BucketOffset { requested_key } => {
+            match entry.state {
+                EntryState::LocatingOffset { requested_key } => {
+                    // Bucket-offset arrived: parse it, queue the entry for Loading.
                     let (entry_offset, _) = BucketOffset::read_from_prefix(&data)
                         .map_err(|_| uio_data_err("Can't read bucket offset"))?;
-                    let byte_offset = self.entries_start + entry_offset;
-                    followups.push((
-                        Pending {
-                            meta: pending.meta,
-                            phase: Phase::Entry {
-                                byte_offset,
-                                data_vec: Vec::new(),
-                                requested_key: Some(requested_key),
-                            },
+                    to_schedule.push(Entry {
+                        meta: entry.meta,
+                        state: EntryState::Loading {
+                            byte_offset: self.entries_start + entry_offset,
+                            data_vec: Vec::new(),
+                            expected_len: entry_read_size_est,
+                            requested_key: Some(requested_key),
                         },
-                        expected_read_size,
-                    ));
+                    });
                 }
-                Phase::Entry {
+                EntryState::Loading {
                     byte_offset,
                     mut data_vec,
                     requested_key,
+                    ..
                 } => {
                     data_vec.extend_from_slice(&data);
 
-                    let mut still_need_key_check = requested_key;
+                    // For key requests, verify the stored key as soon as it's parseable.
+                    let mut unverified_key = requested_key;
                     if let Some(req_key) = requested_key {
                         if let Some(stored_key) = K::from_bytes(&data_vec) {
                             if req_key != stored_key {
-                                f(pending.meta, None)?;
+                                // Mismatch → no entry to return; skip further reads.
+                                f(entry.meta, None)?;
                                 continue;
                             }
-                            still_need_key_check = None;
+                            // Match → no need to re-check on subsequent follow-up reads.
+                            unverified_key = None;
                         }
                     }
 
                     match entry_kind.try_read::<K, V>(&data_vec) {
-                        Ok(entry) => f(pending.meta, Some(entry))?,
-                        Err(expected_len) => followups.push((
-                            Pending {
-                                meta: pending.meta,
-                                phase: Phase::Entry {
-                                    byte_offset,
-                                    data_vec,
-                                    requested_key: still_need_key_check,
-                                },
+                        Ok(parsed) => f(entry.meta, Some(parsed))?,
+                        // Need more bytes: requeue with the new expected length.
+                        Err(expected_len) => to_schedule.push(Entry {
+                            meta: entry.meta,
+                            state: EntryState::Loading {
+                                byte_offset,
+                                data_vec,
+                                expected_len,
+                                requested_key: unverified_key,
                             },
-                            expected_len,
-                        )),
+                        }),
                     }
                 }
             }
