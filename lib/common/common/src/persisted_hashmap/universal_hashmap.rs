@@ -1,6 +1,5 @@
 #![allow(dead_code)] // TODO: remove
 
-use std::borrow::Cow;
 use std::io::{self, Cursor};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -167,6 +166,7 @@ impl<
         }
         let bucket_ids: Vec<u64> = found.iter().map(|(_, _, h)| *h).collect();
         let entry_offsets = self.batch_resolve_bucket_offsets(bucket_ids)?;
+
         let meta_offsets = found
             .into_iter()
             .zip(entry_offsets)
@@ -184,6 +184,75 @@ impl<
     }
 
     fn for_each_sparse_impl<Meta, E: From<UniversalIoError>>(
+        &self,
+        entry_kind: PartialEntryKind,
+        offsets: impl Iterator<Item = (Meta, u64)>,
+        mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let expected_read_size = entry_kind.est_size::<K, V>() as u64;
+
+        let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
+
+        let reads = offsets.into_iter().map(|(meta, offset)| {
+            let byte_offset = self.entries_start + offset;
+            let range = ReadRange {
+                byte_offset,
+                length: file_len.min(expected_read_size),
+            };
+            ((meta, byte_offset), range.clamp::<u8>(file_len))
+        });
+
+        struct ExtraRead<Meta> {
+            meta: Meta,
+            data_vec: Vec<u8>,
+            byte_offset: u64,
+            expected_len: u64,
+        }
+        let mut next_extra_reads: Vec<ExtraRead<Meta>> = Vec::new();
+        for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, reads)? {
+            let ((meta, byte_offset), data) = record?;
+            match entry_kind.try_read::<K, V>(&data) {
+                Ok(entry) => f(meta, entry)?,
+                Err(expected_len) => {
+                    let mut data_vec = Vec::with_capacity(expected_len as usize);
+                    data_vec.extend_from_slice(&data);
+                    next_extra_reads.push(ExtraRead {
+                        meta,
+                        data_vec,
+                        byte_offset,
+                        expected_len,
+                    });
+                }
+            }
+        }
+
+        while !next_extra_reads.is_empty() {
+            let extra_reads = std::mem::take(&mut next_extra_reads)
+                .into_iter()
+                .map(|extra| {
+                    let range = ReadRange {
+                        byte_offset: extra.byte_offset + extra.data_vec.len() as u64,
+                        length: file_len.min(extra.expected_len - extra.data_vec.len() as u64),
+                    };
+                    (extra, range.clamp::<u8>(file_len))
+                });
+            for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, extra_reads)? {
+                let (mut extra, data) = record?;
+                extra.data_vec.extend_from_slice(&data);
+                match entry_kind.try_read::<K, V>(&extra.data_vec) {
+                    Ok(entry) => f(extra.meta, entry)?,
+                    Err(expected_len) => {
+                        extra.expected_len = expected_len;
+                        next_extra_reads.push(extra);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn for_each_sparse_impl2<Meta, E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
         offsets: impl Iterator<Item = (Meta, u64)>,
@@ -312,31 +381,6 @@ impl<
 
     // ── Single-key lookup ───────────────────────────────────────────────
 
-    /// Look up the values associated with `key`, passing them to `f`.
-    ///
-    /// This is the most efficient lookup method: the callback receives a `&[V]` that may
-    /// reference the backing storage directly (zero-copy for mmap-based readers) or a
-    /// temporary read buffer.
-    ///
-    /// Three IO reads are performed: bucket offset, entry header, and values.
-    pub fn get_with<T>(&self, key: &K, f: impl FnOnce(&[V]) -> T) -> Result<Option<T>> {
-        let Some((entry_start, header_size, values_len)) = self.lookup_entry_header(key)? else {
-            return Ok(None);
-        };
-
-        if values_len == 0 {
-            return Ok(Some(f(&[])));
-        }
-
-        let values_start = entry_start + header_size as u64;
-        let values_bytes = self.reader.read::<Random>(ReadRange {
-            byte_offset: values_start,
-            length: u64::from(values_len) * Self::VALUE_SIZE as u64,
-        })?;
-
-        Self::with_values(&values_bytes, f).map(Some)
-    }
-
     pub fn get<'a>(
         &'a self,
         key: &K,
@@ -367,60 +411,6 @@ impl<
             return Ok(None);
         };
         Ok(Some(values_len as usize))
-    }
-
-    // ── Batch lookup ────────────────────────────────────────────────────
-
-    /// Look up multiple keys at once, returning results in the same order as the input.
-    ///
-    /// This is more efficient than calling [`get_with`](Self::get_with) in a loop because
-    /// IO reads are sorted by file position and batched for sequential access.
-    ///
-    /// Three batched IO phases are performed:
-    /// 1. Read bucket offsets (sorted by bucket index).
-    /// 2. Read entry headers (sorted by entry offset) and verify keys.
-    /// 3. Read values for matched entries (sorted by entry offset).
-    pub fn get_with_batch<'k, T>(
-        &self,
-        keys: &[&'k K],
-        mut f: impl FnMut(&K, &[V]) -> T,
-    ) -> Result<Vec<Option<T>>>
-    where
-        K: 'k,
-    {
-        let (idx_mapping, bucket_ids): (Vec<_>, Vec<_>) = keys
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, key)| self.phf.get(key).map(|bucket_id| (idx, bucket_id)))
-            .unzip();
-
-        let entry_offsets = self.batch_resolve_bucket_offsets(bucket_ids)?;
-
-        let (idx_mapping, values_offsets, values_lens) =
-            self.batch_read_entry_headers(keys, idx_mapping, &entry_offsets)?;
-
-        let results =
-            self.batch_read_values(keys, idx_mapping, values_offsets, values_lens, &mut f)?;
-
-        Ok(results)
-    }
-
-    // ── Borrowed iteration ──────────────────────────────────────────────
-
-    /// Iterate over all entries, returning owned `(key, values)` pairs.
-    ///
-    /// Reads the entire entries region at once. Works with both borrowed
-    /// (mmap) and owned (io_uring, etc.) storage backends.
-    pub fn iter(&self) -> Result<impl Iterator<Item = (<K as ToOwned>::Owned, Vec<V>)>>
-    where
-        K: ToOwned,
-    {
-        let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        let data = self.read_entries_region()?;
-        Ok(offsets.into_iter().filter_map(move |off| {
-            let (key, values) = Self::parse_entry_ref(data.get(off as usize..)?)?;
-            Some((key.to_owned(), values.to_vec()))
-        }))
     }
 
     // ── Cache management ────────────────────────────────────────────────
@@ -485,24 +475,6 @@ impl<
         let (offset, _) = BucketOffset::read_from_prefix(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Can't read bucket offset"))?;
         Ok(offset)
-    }
-
-    fn read_entries_region(&self) -> Result<Cow<'_, [u8]>> {
-        let len = UniversalRead::<u8>::len(&self.reader)? - self.entries_start;
-        self.reader.read::<Sequential>(ReadRange {
-            byte_offset: self.entries_start,
-            length: len,
-        })
-    }
-
-    fn parse_entry_ref<'a>(entry: &'a [u8]) -> Option<(&'a K, &'a [V])> {
-        let key = K::from_bytes(entry)?;
-        let kp = Self::key_size_with_padding(key);
-        let (vl, _) = ValuesLen::read_from_prefix(entry.get(kp..)?).ok()?;
-        let vf = kp + Self::values_len_size_with_padding();
-        let vt = vf + vl as usize * Self::VALUE_SIZE;
-        let values = <[V]>::ref_from_bytes(entry.get(vf..vt)?).ok()?;
-        Some((key, values))
     }
 
     fn key_size_with_padding(key: &K) -> usize {
@@ -577,103 +549,6 @@ impl<
         })?;
 
         Ok(entry_offsets)
-    }
-
-    /// Phase 2: read entry headers, verify keys, and parse values_len.
-    fn batch_read_entry_headers(
-        &self,
-        keys: &[&K],
-        idx_mapping: Vec<usize>,
-        entry_offsets: &[u64],
-    ) -> Result<(Vec<usize>, Vec<u64>, Vec<u32>)> {
-        let mut new_idx_mapping = Vec::with_capacity(entry_offsets.len());
-        let mut values_offsets = Vec::with_capacity(entry_offsets.len());
-        let mut values_lens = Vec::with_capacity(entry_offsets.len());
-
-        let ranges = entry_offsets.iter().enumerate().map(|(idx, entry_offset)| {
-            let key = keys[idx_mapping[idx]];
-            let header_size =
-                Self::key_size_with_padding(key) + Self::values_len_size_with_padding();
-            (
-                idx,
-                ReadRange {
-                    byte_offset: self.entries_start + *entry_offset,
-                    length: header_size as u64,
-                },
-            )
-        });
-
-        self.reader.read_batch::<Random, _>(ranges, |idx, data| {
-            let key_id = idx_mapping[idx];
-            let key = keys[key_id];
-            let header_size =
-                Self::key_size_with_padding(key) + Self::values_len_size_with_padding();
-            let entry_offset = entry_offsets[idx];
-
-            if !key.matches(data) {
-                return Ok(());
-            }
-            let key_pad = Self::key_size_with_padding(key);
-            let vl_bytes = data
-                .get(key_pad..)
-                .ok_or_else(|| uio_data_err("Entry too short for values_len"))?;
-            let (vl, _) =
-                ValuesLen::read_from_prefix(vl_bytes).map_err(|e| uio_data_err(e.to_string()))?;
-
-            let values_offset = self.entries_start + entry_offset + header_size as u64;
-
-            values_offsets.push(values_offset);
-            values_lens.push(vl);
-            new_idx_mapping.push(key_id);
-            Ok(())
-        })?;
-
-        Ok((new_idx_mapping, values_offsets, values_lens))
-    }
-
-    /// Phase 3: read values for matched entries and populate results.
-    fn batch_read_values<T>(
-        &self,
-        keys: &[&K],
-        idx_mapping: Vec<usize>,
-        values_offsets: Vec<u64>,
-        values_lens: Vec<u32>,
-        f: &mut impl FnMut(&K, &[V]) -> T,
-    ) -> Result<Vec<Option<T>>> {
-        let mut results: Vec<Option<T>> = Vec::with_capacity(keys.len());
-        results.resize_with(keys.len(), || None);
-
-        // Handle zero-length value matches.
-        for (idx, &values_len) in values_lens.iter().enumerate() {
-            if values_len == 0 {
-                let orig_idx = idx_mapping[idx];
-                results[orig_idx] = Some(f(keys[orig_idx], &[]));
-            }
-        }
-
-        if values_lens.is_empty() {
-            return Ok(results);
-        }
-
-        let ranges = values_offsets
-            .into_iter()
-            .zip(values_lens)
-            .map(|(values_offset, values_len)| ReadRange {
-                byte_offset: values_offset,
-                length: u64::from(values_len) * Self::VALUE_SIZE as u64,
-            })
-            .enumerate();
-
-        self.reader
-            .read_batch::<Sequential, _>(ranges, |idx, data| {
-                let key_id = idx_mapping[idx];
-                let key = keys[key_id];
-                Self::with_values(data, |values| {
-                    results[key_id] = Some(f(key, values));
-                })
-            })?;
-
-        Ok(results)
     }
 }
 
