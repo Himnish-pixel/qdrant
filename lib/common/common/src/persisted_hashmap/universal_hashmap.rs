@@ -232,23 +232,37 @@ impl<
         &self,
         entry_kind: PartialEntryKind,
         offsets: impl Iterator<Item = (Meta, Request<'a, K>)>,
-        mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
+        mut f: impl FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
     ) -> Result<(), E>
     where
-        K: 'a,
+        K: 'a + PartialEq,
     {
         let expected_read_size = entry_kind.est_size::<K, V>() as u64;
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
-        struct Pending<Meta> {
+        struct Pending<'a, Meta, K: Key + ?Sized> {
             meta: Meta,
-            byte_offset: u64,
-            data_vec: Vec<u8>,
+            phase: Phase<'a, K>,
         }
 
-        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Pending<Meta>>::new()?;
+        enum Phase<'a, K: Key + ?Sized> {
+            // Reading the bucket offset value (8 bytes); resolved offset starts the Entry phase.
+            BucketOffset {
+                requested_key: &'a K,
+            },
+            // Reading the entry data. `requested_key` is `Some` while we still need to verify
+            // the stored key matches; `None` once verified or for offset requests.
+            Entry {
+                byte_offset: u64,
+                data_vec: Vec<u8>,
+                requested_key: Option<&'a K>,
+            },
+        }
+
+        let mut pipeline =
+            <R as UniversalRead<u8>>::ReadPipeline::<'_, Pending<'_, Meta, K>>::new()?;
         let mut offsets = offsets.into_iter();
-        let mut followups: Vec<(Pending<Meta>, u64)> = Vec::new();
+        let mut followups: Vec<(Pending<'_, Meta, K>, u64)> = Vec::new();
 
         loop {
             // Refill the pipeline.
@@ -256,9 +270,17 @@ impl<
                 let next_pending;
                 let range;
                 if let Some((pending, expected_len)) = followups.pop() {
-                    let already = pending.data_vec.len() as u64;
+                    let Phase::Entry {
+                        byte_offset,
+                        ref data_vec,
+                        ..
+                    } = pending.phase
+                    else {
+                        unreachable!("followup must be in Entry phase");
+                    };
+                    let already = data_vec.len() as u64;
                     range = ReadRange {
-                        byte_offset: pending.byte_offset + already,
+                        byte_offset: byte_offset + already,
                         length: expected_len - already,
                     };
                     next_pending = pending;
@@ -272,12 +294,28 @@ impl<
                             };
                             next_pending = Pending {
                                 meta,
-                                byte_offset,
-                                data_vec: Vec::new(),
+                                phase: Phase::Entry {
+                                    byte_offset,
+                                    data_vec: Vec::new(),
+                                    requested_key: None,
+                                },
                             };
                         }
                         Request::Key(key) => {
-                            todo!()
+                            let Some(hash) = self.phf.get(key) else {
+                                f(meta, None)?;
+                                continue;
+                            };
+                            let bucket_byte_offset =
+                                self.header.buckets_pos + hash * size_of::<BucketOffset>() as u64;
+                            range = ReadRange {
+                                byte_offset: bucket_byte_offset,
+                                length: size_of::<BucketOffset>() as u64,
+                            };
+                            next_pending = Pending {
+                                meta,
+                                phase: Phase::BucketOffset { requested_key: key },
+                            };
                         }
                     }
                 } else {
@@ -290,13 +328,60 @@ impl<
                 )?;
             }
 
-            let Some((mut pending, data)) = pipeline.wait()? else {
+            let Some((pending, data)) = pipeline.wait()? else {
                 break;
             };
-            pending.data_vec.extend_from_slice(&data);
-            match entry_kind.try_read::<K, V>(&pending.data_vec) {
-                Ok(entry) => f(pending.meta, entry)?,
-                Err(expected_len) => followups.push((pending, expected_len)),
+
+            match pending.phase {
+                Phase::BucketOffset { requested_key } => {
+                    let (entry_offset, _) = BucketOffset::read_from_prefix(&data)
+                        .map_err(|_| uio_data_err("Can't read bucket offset"))?;
+                    let byte_offset = self.entries_start + entry_offset;
+                    followups.push((
+                        Pending {
+                            meta: pending.meta,
+                            phase: Phase::Entry {
+                                byte_offset,
+                                data_vec: Vec::new(),
+                                requested_key: Some(requested_key),
+                            },
+                        },
+                        expected_read_size,
+                    ));
+                }
+                Phase::Entry {
+                    byte_offset,
+                    mut data_vec,
+                    requested_key,
+                } => {
+                    data_vec.extend_from_slice(&data);
+
+                    let mut still_need_key_check = requested_key;
+                    if let Some(req_key) = requested_key {
+                        if let Some(stored_key) = K::from_bytes(&data_vec) {
+                            if req_key != stored_key {
+                                f(pending.meta, None)?;
+                                continue;
+                            }
+                            still_need_key_check = None;
+                        }
+                    }
+
+                    match entry_kind.try_read::<K, V>(&data_vec) {
+                        Ok(entry) => f(pending.meta, Some(entry))?,
+                        Err(expected_len) => followups.push((
+                            Pending {
+                                meta: pending.meta,
+                                phase: Phase::Entry {
+                                    byte_offset,
+                                    data_vec,
+                                    requested_key: still_need_key_check,
+                                },
+                            },
+                            expected_len,
+                        )),
+                    }
+                }
             }
         }
 
