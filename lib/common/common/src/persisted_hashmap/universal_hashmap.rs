@@ -14,7 +14,9 @@ use super::bucket_offsets::BucketOffsets;
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
 use crate::persisted_hashmap::keys::{Key, ReadError, ReadResult};
-use crate::universal_io::{OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead};
+use crate::universal_io::{
+    OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead, UniversalReadPipeline,
+};
 
 type ValuesLen = u32;
 type BucketOffset = u64;
@@ -259,62 +261,58 @@ impl<
         mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
     ) -> Result<(), E> {
         let expected_read_size = entry_kind.est_size::<K, V>() as u64;
+        let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
-        let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
-
-        let reads = offsets.into_iter().map(|(meta, offset)| {
-            let byte_offset = self.entries_start + offset;
-            let range = ReadRange {
-                byte_offset,
-                length: file_len.min(expected_read_size),
-            };
-            ((meta, byte_offset), range.clamp::<u8>(file_len))
-        });
-
-        struct ExtraRead<Meta> {
+        struct Pending<Meta> {
             meta: Meta,
-            data_vec: Vec<u8>,
             byte_offset: u64,
-            expected_len: u64,
+            data_vec: Vec<u8>,
         }
-        let mut next_extra_reads: Vec<ExtraRead<Meta>> = Vec::new();
-        for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, reads)? {
-            let ((meta, byte_offset), data) = record?;
-            match entry_kind.try_read::<K, V>(&data) {
-                Ok(entry) => f(meta, entry)?,
-                Err(expected_len) => {
-                    let mut data_vec = Vec::with_capacity(expected_len as usize);
-                    data_vec.extend_from_slice(&data);
-                    next_extra_reads.push(ExtraRead {
-                        meta,
-                        data_vec,
+
+        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Pending<Meta>>::new()?;
+        let mut offsets = offsets.into_iter();
+        let mut followups: Vec<(Pending<Meta>, u64)> = Vec::new();
+
+        loop {
+            // Refill the pipeline — drain follow-ups before fresh offsets so
+            // each entry completes in as few round-trips as possible.
+            while pipeline.can_schedule() {
+                if let Some((pending, expected_len)) = followups.pop() {
+                    let already = pending.data_vec.len() as u64;
+                    let range = ReadRange {
+                        byte_offset: pending.byte_offset + already,
+                        length: file_len.min(expected_len - already),
+                    }
+                    .clamp::<u8>(file_len);
+                    pipeline.schedule::<Random>(pending, &self.reader, range)?;
+                } else if let Some((meta, offset)) = offsets.next() {
+                    let byte_offset = self.entries_start + offset;
+                    let range = ReadRange {
                         byte_offset,
-                        expected_len,
-                    });
+                        length: file_len.min(expected_read_size),
+                    }
+                    .clamp::<u8>(file_len);
+                    pipeline.schedule::<Random>(
+                        Pending {
+                            meta,
+                            byte_offset,
+                            data_vec: Vec::new(),
+                        },
+                        &self.reader,
+                        range,
+                    )?;
+                } else {
+                    break;
                 }
             }
-        }
 
-        while !next_extra_reads.is_empty() {
-            let extra_reads = std::mem::take(&mut next_extra_reads)
-                .into_iter()
-                .map(|extra| {
-                    let range = ReadRange {
-                        byte_offset: extra.byte_offset + extra.data_vec.len() as u64,
-                        length: file_len.min(extra.expected_len - extra.data_vec.len() as u64),
-                    };
-                    (extra, range.clamp::<u8>(file_len))
-                });
-            for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, extra_reads)? {
-                let (mut extra, data) = record?;
-                extra.data_vec.extend_from_slice(&data);
-                match entry_kind.try_read::<K, V>(&extra.data_vec) {
-                    Ok(entry) => f(extra.meta, entry)?,
-                    Err(expected_len) => {
-                        extra.expected_len = expected_len;
-                        next_extra_reads.push(extra);
-                    }
-                }
+            let Some((mut pending, data)) = pipeline.wait()? else {
+                break;
+            };
+            pending.data_vec.extend_from_slice(&data);
+            match entry_kind.try_read::<K, V>(&pending.data_vec) {
+                Ok(entry) => f(pending.meta, entry)?,
+                Err(expected_len) => followups.push((pending, expected_len)),
             }
         }
 
