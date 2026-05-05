@@ -228,6 +228,81 @@ impl<
         Ok(())
     }
 
+    fn for_each_sparse_impl2<'a, Meta, E: From<UniversalIoError>>(
+        &self,
+        entry_kind: PartialEntryKind,
+        offsets: impl Iterator<Item = (Meta, Request<'a, K>)>,
+        mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        K: 'a,
+    {
+        let expected_read_size = entry_kind.est_size::<K, V>() as u64;
+        let file_len = UniversalRead::<u8>::len(&self.reader)?;
+
+        struct Pending<Meta> {
+            meta: Meta,
+            byte_offset: u64,
+            data_vec: Vec<u8>,
+        }
+
+        let mut pipeline = <R as UniversalRead<u8>>::ReadPipeline::<'_, Pending<Meta>>::new()?;
+        let mut offsets = offsets.into_iter();
+        let mut followups: Vec<(Pending<Meta>, u64)> = Vec::new();
+
+        loop {
+            // Refill the pipeline.
+            while pipeline.can_schedule() {
+                let next_pending;
+                let range;
+                if let Some((pending, expected_len)) = followups.pop() {
+                    let already = pending.data_vec.len() as u64;
+                    range = ReadRange {
+                        byte_offset: pending.byte_offset + already,
+                        length: expected_len - already,
+                    };
+                    next_pending = pending;
+                } else if let Some((meta, request)) = offsets.next() {
+                    match request {
+                        Request::Offset(offset) => {
+                            let byte_offset = self.entries_start + offset;
+                            range = ReadRange {
+                                byte_offset,
+                                length: expected_read_size,
+                            };
+                            next_pending = Pending {
+                                meta,
+                                byte_offset,
+                                data_vec: Vec::new(),
+                            };
+                        }
+                        Request::Key(key) => {
+                            todo!()
+                        }
+                    }
+                } else {
+                    break;
+                }
+                pipeline.schedule::<Random>(
+                    next_pending,
+                    &self.reader,
+                    range.clamp::<u8>(file_len),
+                )?;
+            }
+
+            let Some((mut pending, data)) = pipeline.wait()? else {
+                break;
+            };
+            pending.data_vec.extend_from_slice(&data);
+            match entry_kind.try_read::<K, V>(&pending.data_vec) {
+                Ok(entry) => f(pending.meta, entry)?,
+                Err(expected_len) => followups.push((pending, expected_len)),
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn for_each_entry<E: From<UniversalIoError>>(
         &self,
         mut f: impl FnMut(&K, &[V]) -> Result<(), E>,
@@ -428,6 +503,11 @@ impl<
 
 fn uio_data_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> UniversalIoError {
     UniversalIoError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
+}
+
+enum Request<'a, K: Key + ?Sized> {
+    Offset(u64),
+    Key(&'a K),
 }
 
 #[derive(Copy, Clone)]
