@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO: remove
-
 use std::io::{self, Cursor};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -34,26 +32,6 @@ struct Header {
 pub const READ_ENTRY_OVERHEAD: usize = super::mmap_hashmap::READ_ENTRY_OVERHEAD;
 
 /// On-disk hash map accessed via [`UniversalRead`].
-///
-/// Uses the same on-disk layout as [`super::mmap_hashmap::MmapHashMap`] and can open files
-/// created by [`MmapHashMap::create`](super::mmap_hashmap::MmapHashMap::create).
-///
-/// Unlike the mmap variant, this implementation does not return borrowed slices into the
-/// underlying storage. Instead it reads data on demand through the universal IO interface.
-///
-/// ## Access patterns
-///
-/// | Method              | IO reads | Allocations | Notes                              |
-/// |---------------------|----------|-------------|------------------------------------|
-/// | [`get_with`]        | 3        | 0–1         | Callback receives `&[V]` directly  |
-/// | [`get`]             | 3        | 1           | Returns `Vec<V>`                   |
-/// | [`get_values_count`]| 2        | 0           | Skips reading values entirely      |
-/// | [`for_each_entry`]  | 2        | 0–N         | Bulk reads buckets + entries       |
-///
-/// [`get_with`]: Self::get_with
-/// [`get`]: Self::get
-/// [`get_values_count`]: Self::get_values_count
-/// [`for_each_entry`]: Self::for_each_entry
 pub struct UniversalHashMap<
     K: ?Sized,
     V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
@@ -192,75 +170,6 @@ impl<
         mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
     ) -> Result<(), E> {
         let expected_read_size = entry_kind.est_size::<K, V>() as u64;
-
-        let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
-
-        let reads = offsets.into_iter().map(|(meta, offset)| {
-            let byte_offset = self.entries_start + offset;
-            let range = ReadRange {
-                byte_offset,
-                length: file_len.min(expected_read_size),
-            };
-            ((meta, byte_offset), range.clamp::<u8>(file_len))
-        });
-
-        struct ExtraRead<Meta> {
-            meta: Meta,
-            data_vec: Vec<u8>,
-            byte_offset: u64,
-            expected_len: u64,
-        }
-        let mut next_extra_reads: Vec<ExtraRead<Meta>> = Vec::new();
-        for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, reads)? {
-            let ((meta, byte_offset), data) = record?;
-            match entry_kind.try_read::<K, V>(&data) {
-                Ok(entry) => f(meta, entry)?,
-                Err(expected_len) => {
-                    let mut data_vec = Vec::with_capacity(expected_len as usize);
-                    data_vec.extend_from_slice(&data);
-                    next_extra_reads.push(ExtraRead {
-                        meta,
-                        data_vec,
-                        byte_offset,
-                        expected_len,
-                    });
-                }
-            }
-        }
-
-        while !next_extra_reads.is_empty() {
-            let extra_reads = std::mem::take(&mut next_extra_reads)
-                .into_iter()
-                .map(|extra| {
-                    let range = ReadRange {
-                        byte_offset: extra.byte_offset + extra.data_vec.len() as u64,
-                        length: file_len.min(extra.expected_len - extra.data_vec.len() as u64),
-                    };
-                    (extra, range.clamp::<u8>(file_len))
-                });
-            for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, extra_reads)? {
-                let (mut extra, data) = record?;
-                extra.data_vec.extend_from_slice(&data);
-                match entry_kind.try_read::<K, V>(&extra.data_vec) {
-                    Ok(entry) => f(extra.meta, entry)?,
-                    Err(expected_len) => {
-                        extra.expected_len = expected_len;
-                        next_extra_reads.push(extra);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn for_each_sparse_impl2<Meta, E: From<UniversalIoError>>(
-        &self,
-        entry_kind: PartialEntryKind,
-        offsets: impl Iterator<Item = (Meta, u64)>,
-        mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let expected_read_size = entry_kind.est_size::<K, V>() as u64;
         let file_len = UniversalRead::<u8>::len(&self.reader)?;
 
         struct Pending<Meta> {
@@ -274,36 +183,36 @@ impl<
         let mut followups: Vec<(Pending<Meta>, u64)> = Vec::new();
 
         loop {
-            // Refill the pipeline — drain follow-ups before fresh offsets so
-            // each entry completes in as few round-trips as possible.
+            // Refill the pipeline.
             while pipeline.can_schedule() {
+                let next_pending;
+                let range;
                 if let Some((pending, expected_len)) = followups.pop() {
                     let already = pending.data_vec.len() as u64;
-                    let range = ReadRange {
+                    range = ReadRange {
                         byte_offset: pending.byte_offset + already,
-                        length: file_len.min(expected_len - already),
-                    }
-                    .clamp::<u8>(file_len);
-                    pipeline.schedule::<Random>(pending, &self.reader, range)?;
+                        length: expected_len - already,
+                    };
+                    next_pending = pending;
                 } else if let Some((meta, offset)) = offsets.next() {
                     let byte_offset = self.entries_start + offset;
-                    let range = ReadRange {
+                    range = ReadRange {
                         byte_offset,
-                        length: file_len.min(expected_read_size),
-                    }
-                    .clamp::<u8>(file_len);
-                    pipeline.schedule::<Random>(
-                        Pending {
-                            meta,
-                            byte_offset,
-                            data_vec: Vec::new(),
-                        },
-                        &self.reader,
-                        range,
-                    )?;
+                        length: expected_read_size,
+                    };
+                    next_pending = Pending {
+                        meta,
+                        byte_offset,
+                        data_vec: Vec::new(),
+                    };
                 } else {
                     break;
                 }
+                pipeline.schedule::<Random>(
+                    next_pending,
+                    &self.reader,
+                    range.clamp::<u8>(file_len),
+                )?;
             }
 
             let Some((mut pending, data)) = pipeline.wait()? else {
@@ -487,39 +396,6 @@ impl<
         let (len, _) = ValuesLen::read_from_prefix(bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Can't read values_len"))?;
         Ok(len)
-    }
-
-    /// Interpret `bytes` as `&[V]` and pass to the callback.
-    ///
-    /// Fast path: if `bytes` are properly aligned for `V`, zero-copy reinterpretation.
-    /// Slow path: copy into an aligned `Vec<V>` element-by-element.
-    fn with_values<T>(bytes: &[u8], f: impl FnOnce(&[V]) -> T) -> Result<T> {
-        if let Ok(values) = <[V]>::ref_from_bytes(bytes) {
-            return Ok(f(values));
-        }
-        debug_assert!(
-            false,
-            "Values bytes not aligned for zero-copy; falling back to copy"
-        );
-        let values = Self::copy_values_from_bytes(bytes)?;
-        Ok(f(&values))
-    }
-
-    /// Copy bytes into a `Vec<V>` one element at a time (alignment-safe).
-    fn copy_values_from_bytes(bytes: &[u8]) -> Result<Vec<V>> {
-        if Self::VALUE_SIZE == 0 || !bytes.len().is_multiple_of(Self::VALUE_SIZE) {
-            return Err(uio_data_err(format!(
-                "Values byte length {} is not a multiple of value size {}",
-                bytes.len(),
-                Self::VALUE_SIZE,
-            )));
-        }
-        bytes
-            .chunks_exact(Self::VALUE_SIZE)
-            .map(|chunk| {
-                V::read_from_bytes(chunk).map_err(|_| uio_data_err("Can't read value from bytes"))
-            })
-            .collect()
     }
 
     // ── Batch-lookup helpers ───────────────────────────────────────────
