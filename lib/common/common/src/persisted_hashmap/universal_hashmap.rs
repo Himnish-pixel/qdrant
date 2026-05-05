@@ -182,7 +182,7 @@ impl<
         &self,
         mut f: impl FnMut(&K, &[V]) -> Result<(), E>,
     ) -> Result<(), E> {
-        let file_len = UniversalRead::<u8>::len(&self.reader)?;
+        let file_len = self.reader.len()?;
 
         let range = ReadRange {
             byte_offset: self.entries_start,
@@ -195,10 +195,10 @@ impl<
 
         let mut state = State { key_size: None };
 
-        let iter = OrderingIterator::new(UniversalRead::<u8>::read_iter::<Sequential, usize>(
-            &self.reader,
-            range.iter_autochunks::<u8>().enumerate(),
-        )?);
+        let iter = OrderingIterator::new(
+            self.reader
+                .read_iter::<Sequential, usize>(range.iter_autochunks::<u8>().enumerate())?,
+        );
 
         for record in iter {
             let (_, mini_buf) = record?;
@@ -273,12 +273,12 @@ impl<
 
     /// Populate the RAM cache for the backing file.
     pub fn populate(&self) -> Result<()> {
-        UniversalRead::<u8>::populate(&self.reader)
+        self.reader.populate()
     }
 
     /// Evict the backing file data from RAM cache.
     pub fn clear_ram_cache(&self) -> Result<()> {
-        UniversalRead::<u8>::clear_ram_cache(&self.reader)
+        self.reader.clear_ram_cache()
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
@@ -387,7 +387,7 @@ where
 {
     fn new(map: &'m UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
         let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
-        let file_len = UniversalRead::<u8>::len(&map.reader)?;
+        let file_len = map.reader.len()?;
         Ok(Self {
             map,
             entry_kind,
@@ -430,25 +430,25 @@ where
         }
         // Pull from `requests`, skipping over PHF misses.
         while let Some((meta, request)) = requests.next() {
-            let (entry, range) = match request {
+            let entry;
+            let range;
+            match request {
                 Request::Offset(offset) => {
                     // Offset request: location is known, jump straight to Loading.
                     let byte_offset = self.map.entries_start + offset;
-                    (
-                        Entry {
-                            meta,
-                            state: EntryState::Loading {
-                                byte_offset,
-                                data_vec: Vec::new(),
-                                expected_len: self.entry_read_size_est,
-                                requested_key: None,
-                            },
-                        },
-                        ReadRange {
+                    entry = Entry {
+                        meta,
+                        state: EntryState::Loading {
                             byte_offset,
-                            length: self.entry_read_size_est,
+                            data_vec: Vec::new(),
+                            expected_len: self.entry_read_size_est,
+                            requested_key: None,
                         },
-                    )
+                    };
+                    range = ReadRange {
+                        byte_offset,
+                        length: self.entry_read_size_est,
+                    };
                 }
                 Request::Key(key) => {
                     // PHF miss: no stored entry; report immediately and continue.
@@ -460,18 +460,16 @@ where
                     // Loading once the offset arrives.
                     let bucket_byte_offset =
                         self.map.header.buckets_pos + hash * size_of::<BucketOffset>() as u64;
-                    (
-                        Entry {
-                            meta,
-                            state: EntryState::LocatingOffset { requested_key: key },
-                        },
-                        ReadRange {
-                            byte_offset: bucket_byte_offset,
-                            length: size_of::<BucketOffset>() as u64,
-                        },
-                    )
+                    entry = Entry {
+                        meta,
+                        state: EntryState::LocatingOffset { requested_key: key },
+                    };
+                    range = ReadRange {
+                        byte_offset: bucket_byte_offset,
+                        length: size_of::<BucketOffset>() as u64,
+                    };
                 }
-            };
+            }
             return Ok(Some((entry, range.clamp::<u8>(self.file_len))));
         }
         Ok(None)
