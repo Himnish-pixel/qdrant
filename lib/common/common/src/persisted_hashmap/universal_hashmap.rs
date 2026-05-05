@@ -134,55 +134,90 @@ impl<
         mut f: impl FnMut(&K) -> Result<(), E>,
     ) -> Result<(), E> {
         let offsets = self.read_all_bucket_offsets()?.to_sorted_vec();
-        self.for_each_sparse_impl(PartialEntryKind::KeyOnly, offsets.into_iter(), |entry| {
-            let PartialEntry::KeyOnly(key) = entry else {
-                unreachable!()
-            };
-            f(key)
-        })
+        self.for_each_sparse_impl(
+            PartialEntryKind::KeyOnly,
+            offsets.into_iter().map(|o| ((), o)),
+            |(), entry| {
+                let PartialEntry::KeyOnly(key) = entry else {
+                    unreachable!()
+                };
+                f(key)
+            },
+        )
     }
 
-    pub fn batch_with_entry<Meta, E: From<UniversalIoError>>(
+    pub fn batch_with_entry<'k, Meta, E: From<UniversalIoError>>(
         &self,
-        keys: impl IntoIterator<Item = (Meta, K)>,
-        mut f: impl FnMut(Meta, &K) -> Result<(), E>,
-    ) -> Result<(), E> {
-        todo!("resolve offsets, then call for_each_sparse_impl")
+        keys: impl IntoIterator<Item = (Meta, &'k K)>,
+        mut f: impl FnMut(Meta, Option<&[V]>) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        K: 'k + PartialEq,
+    {
+        let mut found: Vec<(Meta, &K, u64)> = Vec::new();
+        for (meta, key) in keys {
+            if let Some(h) = self.phf.get(key) {
+                found.push((meta, key, h));
+            } else {
+                f(meta, None)?;
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        let bucket_ids: Vec<u64> = found.iter().map(|(_, _, h)| *h).collect();
+        let entry_offsets = self.batch_resolve_bucket_offsets(bucket_ids)?;
+        let meta_offsets = found
+            .into_iter()
+            .zip(entry_offsets)
+            .map(|((meta, key, _), offset)| ((meta, key), offset));
+        self.for_each_sparse_impl(
+            PartialEntryKind::KeyAndValues(1),
+            meta_offsets,
+            |(meta, requested), entry| {
+                let PartialEntry::KeyAndValues(stored, values) = entry else {
+                    unreachable!()
+                };
+                f(meta, (requested == stored).then_some(values))
+            },
+        )
     }
 
-    fn for_each_sparse_impl<E: From<UniversalIoError>>(
+    fn for_each_sparse_impl<Meta, E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
-        offsets: impl Iterator<Item = u64>,
-        mut f: impl FnMut(PartialEntry<'_, K, V>) -> Result<(), E>,
+        offsets: impl Iterator<Item = (Meta, u64)>,
+        mut f: impl FnMut(Meta, PartialEntry<'_, K, V>) -> Result<(), E>,
     ) -> Result<(), E> {
         let expected_read_size = entry_kind.est_size::<K, V>() as u64;
 
         let file_len = UniversalRead::<u8>::len(&self.reader)?; // TODO: use .len()
 
-        let reads = offsets.into_iter().map(|offset| {
+        let reads = offsets.into_iter().map(|(meta, offset)| {
             let byte_offset = self.entries_start + offset;
             let range = ReadRange {
                 byte_offset,
                 length: file_len.min(expected_read_size),
             };
-            (byte_offset, range.clamp::<u8>(file_len))
+            ((meta, byte_offset), range.clamp::<u8>(file_len))
         });
 
-        struct ExtraRead {
+        struct ExtraRead<Meta> {
+            meta: Meta,
             data_vec: Vec<u8>,
             byte_offset: u64,
             expected_len: u64,
         }
-        let mut next_extra_reads = Vec::new();
+        let mut next_extra_reads: Vec<ExtraRead<Meta>> = Vec::new();
         for record in UniversalRead::<u8>::read_iter::<Random, _>(&self.reader, reads)? {
-            let (byte_offset, data) = record?;
+            let ((meta, byte_offset), data) = record?;
             match entry_kind.try_read::<K, V>(&data) {
-                Ok(entry) => f(entry)?,
+                Ok(entry) => f(meta, entry)?,
                 Err(expected_len) => {
                     let mut data_vec = Vec::with_capacity(expected_len as usize);
                     data_vec.extend_from_slice(&data);
                     next_extra_reads.push(ExtraRead {
+                        meta,
                         data_vec,
                         byte_offset,
                         expected_len,
@@ -205,7 +240,7 @@ impl<
                 let (mut extra, data) = record?;
                 extra.data_vec.extend_from_slice(&data);
                 match entry_kind.try_read::<K, V>(&extra.data_vec) {
-                    Ok(entry) => f(entry)?,
+                    Ok(entry) => f(extra.meta, entry)?,
                     Err(expected_len) => {
                         extra.expected_len = expected_len;
                         next_extra_reads.push(extra);

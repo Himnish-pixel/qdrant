@@ -630,25 +630,23 @@ impl InvertedIndex for MmapInvertedIndex {
 
     fn for_each_token_id<'a, Meta>(
         &self,
-        mut tokens: impl Iterator<Item = (Meta, &'a str)>,
+        tokens: impl Iterator<Item = (Meta, &'a str)>,
         hw_counter: &HardwareCounterCell,
         mut f: impl FnMut(Meta, Option<TokenId>),
     ) -> OperationResult<()> {
-        tokens.try_for_each(|(meta, token)| {
-            if self.is_on_disk {
-                hw_counter.payload_index_io_read_counter().incr_delta(
-                    READ_ENTRY_OVERHEAD + size_of::<TokenId>(), // Avoid check overhead and assume token is always read
-                );
-            }
-
-            let token_id = self
-                .storage
-                .vocab
-                .get(token.as_ref())?
-                .and_then(<[TokenId]>::first)
-                .copied();
-            f(meta, token_id);
-            Ok(())
-        })
+        if self.is_on_disk {
+            // TODO: multiply by amount of queries
+            hw_counter.payload_index_io_read_counter().incr_delta(
+                READ_ENTRY_OVERHEAD + size_of::<TokenId>(), // Avoid check overhead and assume token is always read
+            );
+        }
+        self.storage.vocab2.batch_with_entry(
+            tokens,
+            |meta, token_ids| match token_ids {
+                Some([token_id]) => Ok(f(meta, Some(*token_id))),
+                Some(_) => unreachable!(),
+                None => Ok(f(meta, None)),
+            },
+        )
     }
 }
