@@ -11,7 +11,9 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::fs::{atomic_save_json, clear_disk_cache, read_json};
 use common::mmap::create_and_ensure_length;
-use common::mmap_hashmap::{Key, MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::keys::Key;
+use common::persisted_hashmap::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::universal_hashmap::UniversalHashMap;
 use common::stored_bitslice::MmapBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFile, OpenOptions};
@@ -49,7 +51,7 @@ pub struct MmapMapIndex<N: MapIndexKey + Key + ?Sized> {
 }
 
 pub(super) struct Storage<N: MapIndexKey + Key + ?Sized> {
-    pub(super) value_to_points: MmapHashMap<N, PointOffsetType>,
+    pub(super) value_to_points: UniversalHashMap<N, PointOffsetType, MmapFile>,
     point_to_values: StoredPointToValues<N, MmapFile>,
     /// In-memory deletion bitmap. Reconstructed at load time as the union of
     /// the build-time empty-payload bits read from `deleted.bin` and the
@@ -95,7 +97,6 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
 
         let do_populate = !is_on_disk;
 
-        let hashmap = MmapHashMap::open(&hashmap_path, do_populate)?;
         let point_to_values = StoredPointToValues::open(path, do_populate)?;
 
         let mut deleted = deleted_points.to_owned();
@@ -116,7 +117,14 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         Ok(Some(Self {
             path: path.to_path_buf(),
             storage: Storage {
-                value_to_points: hashmap,
+                value_to_points: UniversalHashMap::open(
+                    &hashmap_path,
+                    // TODO: move options somewhere
+                    OpenOptions {
+                        populate: Some(do_populate),
+                        ..OpenOptions::default()
+                    },
+                )?,
                 point_to_values,
                 deleted,
             },
@@ -342,8 +350,8 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             .payload_index_io_read_counter()
             .incr_delta(READ_ENTRY_OVERHEAD);
 
-        match self.storage.value_to_points.get(value) {
-            Ok(Some(points)) => Some(points.len()),
+        match self.storage.value_to_points.get_values_count(value) {
+            Ok(Some(count)) => Some(count),
             Ok(None) => None,
             Err(err) => {
                 debug_assert!(
@@ -360,23 +368,16 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
 
         match self.storage.value_to_points.get(value) {
-            Ok(Some(slice)) => {
+            Ok(Some(iter)) => {
                 // We're iterating over the whole (mmapped) slice
                 hw_counter
                     .payload_index_io_read_counter()
-                    .incr_delta(size_of_val(slice) + READ_ENTRY_OVERHEAD);
+                    .incr_delta(size_of::<PointOffsetType>() + READ_ENTRY_OVERHEAD);
 
                 Box::new(
-                    slice
-                        .iter()
-                        .filter(|idx| {
-                            !self
-                                .storage
-                                .deleted
-                                .get_bit(**idx as usize)
-                                .unwrap_or(false)
-                        })
-                        .copied(),
+                    iter.map(|idx| idx.unwrap()).filter(|idx| {
+                        !self.storage.deleted.get_bit(*idx as usize).unwrap_or(false)
+                    }),
                 )
             }
             Ok(None) => {
@@ -397,11 +398,8 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         }
     }
 
-    pub fn for_each_value(
-        &self,
-        mut f: impl FnMut(&N) -> OperationResult<()>,
-    ) -> OperationResult<()> {
-        self.storage.value_to_points.keys().try_for_each(&mut f)
+    pub fn for_each_value(&self, f: impl FnMut(&N) -> OperationResult<()>) -> OperationResult<()> {
+        self.storage.value_to_points.for_each_key(f)
     }
 
     pub fn for_each_count_per_value(
@@ -409,7 +407,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         deferred_internal_id: Option<PointOffsetType>,
         mut f: impl FnMut(&N, usize) -> OperationResult<()>,
     ) -> OperationResult<()> {
-        self.storage.value_to_points.iter().try_for_each(|(k, v)| {
+        self.storage.value_to_points.for_each_entry(|k, v| {
             let count = v
                 .iter()
                 .filter(|&&idx| {
@@ -421,37 +419,35 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
                 })
                 .unique()
                 .count();
-            f(k, count)
+            f(k.borrow(), count)
         })
     }
 
-    pub fn for_each_value_map<'a>(
-        &'a self,
-        hw_counter: &'a HardwareCounterCell,
-        mut f: impl FnMut(&'a N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()> + 'a,
+    pub fn for_each_value_map(
+        &self,
+        hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(&N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
     ) -> OperationResult<()> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
+        let deleted = &self.storage.deleted;
 
-        self.storage
-            .value_to_points
-            .iter()
-            .try_for_each(move |(k, v)| {
-                hw_counter
-                    .payload_index_io_read_counter()
-                    .incr_delta(k.write_bytes());
+        self.storage.value_to_points.for_each_entry(|k, v| {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(k.borrow().write_bytes());
 
-                let mut iter = v
-                    .iter()
-                    .copied()
-                    .filter(|idx| !self.storage.deleted.get_bit(*idx as usize).unwrap_or(true))
-                    .measure_hw_with_acc(
-                        hw_counter.new_accumulator(),
-                        size_of::<PointOffsetType>(),
-                        |i| i.payload_index_io_read_counter(),
-                    );
+            let mut iter = v
+                .iter()
+                .copied()
+                .filter(|idx| !deleted.get_bit(*idx as usize).unwrap_or(true))
+                .measure_hw_with_acc(
+                    hw_counter.new_accumulator(),
+                    size_of::<PointOffsetType>(),
+                    |i| i.payload_index_io_read_counter(),
+                );
 
-                f(k, &mut iter)
-            })
+            f(k.borrow(), &mut iter)
+        })
     }
 
     fn make_conditioned_counter<'a>(
@@ -487,7 +483,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             point_to_values,
             deleted: _,
         } = storage;
-        value_to_points.clear_cache()?;
+        value_to_points.clear_ram_cache()?;
         clear_disk_cache(&path.join(DELETED_PATH))?;
         point_to_values.clear_cache()?;
         Ok(())

@@ -4,8 +4,9 @@ use std::iter;
 use std::ops::Range;
 use std::path::PathBuf;
 
-use common::bitvec::{BitSliceExt, BitVec};
-use common::mmap_hashmap::Key;
+use bitvec::vec::BitVec;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::persisted_hashmap::keys::Key;
 use common::types::PointOffsetType;
 use gridstore::Blob;
 
@@ -47,23 +48,8 @@ where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
     /// Open and load immutable numeric index from mmap storage
-    pub(super) fn open_mmap(index: MmapMapIndex<N>) -> Self {
-        // Construct intermediate values to points map from backing storage
-        let mapping = || {
-            index.storage.value_to_points.iter().map(|(value, ids)| {
-                (
-                    value,
-                    ids.iter().copied().filter(|idx| {
-                        let is_deleted = index
-                            .storage
-                            .deleted
-                            .get_bit(*idx as usize)
-                            .unwrap_or(false);
-                        !is_deleted
-                    }),
-                )
-            })
-        };
+    pub(super) fn open_mmap(index: MmapMapIndex<N>) -> OperationResult<Self> {
+        let hw_counter = HardwareCounterCell::disposable(); // Internal operation
 
         let mut indexed_points = 0;
         let mut values_count = 0;
@@ -71,7 +57,7 @@ where
 
         // Create points to values mapping
         let mut point_to_values: Vec<Vec<<N as MapIndexKey>::Owned>> = vec![];
-        for (value, ids) in mapping() {
+        index.for_each_value_map(&hw_counter, |value, ids| {
             for idx in ids {
                 if point_to_values.len() <= idx as usize {
                     point_to_values.resize_with(idx as usize + 1, Vec::new)
@@ -85,7 +71,8 @@ where
 
                 point_values.push(MapIndexKey::to_owned(value));
             }
-        }
+            Ok(())
+        })?;
         let point_to_values = ImmutablePointToValues::new(point_to_values);
 
         // Create flattened values-to-points mapping. Skip values whose live
@@ -95,10 +82,10 @@ where
         // `remove_idx_from_value_list`: `value_to_points` only ever contains
         // entries with `count > 0`.
         let mut value_to_points_container = Vec::with_capacity(values_count);
-        for (value, points) in mapping() {
-            let points = points.into_iter().collect::<Vec<_>>();
+        index.for_each_value_map(&hw_counter, |value, ids| {
+            let points = ids.collect::<Vec<_>>();
             if points.is_empty() {
-                continue;
+                return Ok(());
             }
             let container_len = value_to_points_container.len() as u32;
             let range = container_len..container_len + points.len() as u32;
@@ -110,7 +97,8 @@ where
                 },
             );
             value_to_points_container.extend(points);
-        }
+            Ok(())
+        })?;
         value_to_points.shrink_to_fit();
 
         // Sort IDs in each slice of points
@@ -146,7 +134,7 @@ where
             cached_ram_usage_bytes: 0,
         };
         result.cached_ram_usage_bytes = result.compute_ram_usage_bytes();
-        result
+        Ok(result)
     }
 
     /// Return mutable slice of a container which holds point_ids for given value.

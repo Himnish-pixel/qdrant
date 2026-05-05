@@ -6,7 +6,8 @@ use common::bitvec::{BitSlice, BitSliceExt, BitVec};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::fs::clear_disk_cache;
 use common::mmap::{self, Advice, AdviceSetting, MmapSlice, create_and_ensure_length};
-use common::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
+use common::persisted_hashmap::universal_hashmap::UniversalHashMap;
 use common::stored_bitslice::MmapBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFile, OpenOptions};
@@ -63,6 +64,8 @@ pub struct MmapInvertedIndex {
 pub(in crate::index::field_index::full_text_index) struct Storage {
     pub(in crate::index::field_index::full_text_index) postings: MmapPostingsEnum,
     pub(in crate::index::field_index::full_text_index) vocab: MmapHashMap<str, TokenId>,
+    pub(in crate::index::field_index::full_text_index) vocab2:
+        UniversalHashMap<str, TokenId, MmapFile>,
     pub(in crate::index::field_index::full_text_index) point_to_tokens_count: MmapSlice<usize>,
     pub(in crate::index::field_index::full_text_index) deleted_points: BitVec,
 }
@@ -72,6 +75,7 @@ impl Storage {
         let Self {
             postings: _,
             vocab: _,
+            vocab2: _,
             point_to_tokens_count: _,
             deleted_points,
         } = self;
@@ -177,6 +181,13 @@ impl MmapInvertedIndex {
             }
         };
         let vocab = MmapHashMap::<str, TokenId>::open(&vocab_path, false)?;
+        let vocab2 = UniversalHashMap::<str, TokenId, MmapFile>::open(
+            &vocab_path,
+            OpenOptions {
+                populate: Some(populate),
+                ..OpenOptions::default()
+            },
+        )?;
 
         let point_to_tokens_count = unsafe {
             MmapSlice::try_from(mmap::open_write_mmap(
@@ -208,6 +219,7 @@ impl MmapInvertedIndex {
             storage: Storage {
                 postings,
                 vocab,
+                vocab2,
                 point_to_tokens_count,
                 deleted_points: deleted,
             },
@@ -216,12 +228,14 @@ impl MmapInvertedIndex {
         }))
     }
 
-    pub(super) fn iter_vocab(&self) -> impl Iterator<Item = (&str, &TokenId)> + '_ {
-        // unwrap safety: we know that each token points to a token id.
-        self.storage
-            .vocab
-            .iter()
-            .map(|(k, v)| (k, v.first().unwrap()))
+    pub(super) fn for_each_vocab(
+        &self,
+        mut f: impl FnMut(&str, TokenId) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        self.storage.vocab.iter().try_for_each(|(k, v)| {
+            // unwrap safety: we know that each token points to a token id.
+            f(k, *v.first().unwrap())
+        })
     }
 
     /// Returns whether the point id is valid and active.
@@ -460,7 +474,7 @@ impl MmapInvertedIndex {
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
         self.storage.postings.populate()?;
-        self.storage.vocab.populate()?;
+        self.storage.vocab2.populate()?;
         self.storage.point_to_tokens_count.populate()?;
         Ok(())
     }
@@ -475,12 +489,13 @@ impl MmapInvertedIndex {
         } = self;
         let Storage {
             postings,
-            vocab,
+            vocab: _,
+            vocab2,
             point_to_tokens_count,
             deleted_points: _,
         } = storage;
         postings.clear_cache()?;
-        vocab.clear_cache()?;
+        vocab2.clear_ram_cache()?;
         point_to_tokens_count.clear_cache()?;
         clear_disk_cache(&path.join(DELETED_POINTS_FILE))?;
         Ok(())
@@ -549,17 +564,16 @@ impl InvertedIndex for MmapInvertedIndex {
         self.storage.postings.posting_len(token_id)
     }
 
-    fn vocab_with_postings_len_iter(
+    fn for_each_vocab_with_postings_len(
         &self,
-    ) -> impl Iterator<Item = OperationResult<(&str, usize)>> + '_ {
-        self.iter_vocab().filter_map(move |(token, &token_id)| {
-            // Surface read errors as iterator items; drop tokens with no
-            // posting list silently (same as the in-memory variants).
-            match self.storage.postings.posting_len(token_id) {
-                Ok(Some(posting_len)) => Some(Ok((token, posting_len))),
-                Ok(None) => None,
-                Err(err) => Some(Err(err)),
+        mut f: impl FnMut(&str, usize) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        self.for_each_vocab(|token, token_id| {
+            // Drop tokens with no posting list silently (same as the in-memory variants).
+            if let Some(posting_len) = self.storage.postings.posting_len(token_id)? {
+                f(token, posting_len)?;
             }
+            Ok(())
         })
     }
 
