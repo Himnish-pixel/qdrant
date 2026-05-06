@@ -1,9 +1,22 @@
+// TODO: rename to "entry.rs"
+
 use std::convert::Infallible;
 use std::hash::Hash;
 use std::io::Write;
 use std::{io, str};
 
-use zerocopy::{ConvertError, FromBytes, IntoBytes};
+use zerocopy::{ConvertError, FromBytes, Immutable, IntoBytes, KnownLayout};
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub(super) struct Header {
+    pub key_type: [u8; 8],
+    pub buckets_pos: u64,
+    pub buckets_count: u64,
+}
+
+pub(super) type ValuesLen = u32;
+pub(super) type BucketOffset = u64;
 
 pub enum ReadError {
     Invalid,
@@ -175,4 +188,65 @@ impl<A, S> From<ConvertError<A, S, Infallible>> for ReadError {
             ConvertError::Size(_) => ReadError::Incomplete,
         }
     }
+}
+
+pub enum ParsedEntry<'a, K: Key + ?Sized, V> {
+    Invalid,
+    NoKey,
+    Key(&'a K),
+    KeyAndValuesLen(&'a K, u32),
+    KeyAndValues(&'a K, &'a [V], &'a [u8]),
+}
+
+pub fn parse_entry<'a, K: Key + ?Sized, V: FromBytes + Immutable>(
+    buf: &'a [u8],
+) -> ParsedEntry<'a, K, V> {
+    // ┌─1:pad─┬────2:key─────┬─3:pad─┬─4:len─┬─5:pad─┬─────6:vals─────┐
+    // │ · · · │ "abcdef\xFF" │ · · · │   5   │ · · · │ 10 20 30 40 50 │
+    // └───────┴──────────────┴───────┴───────┴───────┴────────────────┘
+
+    // 1. padding for the key
+    let Some(buf) = align_slice_to(K::ALIGN, buf) else {
+        return ParsedEntry::NoKey;
+    };
+
+    // 2. key
+    let key = match K::from_bytes_streaming(buf, 0) {
+        Ok(k) => k,
+        Err(ReadError::Incomplete) => return ParsedEntry::NoKey,
+        Err(ReadError::Invalid) => return ParsedEntry::Invalid,
+    };
+    let Some(buf) = buf.get(key.write_bytes()..) else {
+        return ParsedEntry::Key(key);
+    };
+
+    // 3. padding for values_len
+    let Some(buf) = align_slice_to(size_of::<ValuesLen>(), buf) else {
+        return ParsedEntry::Key(key);
+    };
+
+    // 4. values_len
+    let (&values_len, buf) = match ValuesLen::ref_from_prefix(buf) {
+        Ok(v) => v,
+        Err(ConvertError::Alignment(_)) => return ParsedEntry::Invalid,
+        Err(ConvertError::Size(_)) => return ParsedEntry::Key(key),
+    };
+
+    // 5. padding for values
+    let Some(buf) = align_slice_to(size_of::<V>(), buf) else {
+        return ParsedEntry::KeyAndValuesLen(key, values_len);
+    };
+
+    // 6. values
+    let (values, buf) = match <[V]>::ref_from_prefix_with_elems(buf, values_len as usize) {
+        Ok(v) => v,
+        Err(ConvertError::Alignment(_)) => return ParsedEntry::Invalid,
+        Err(ConvertError::Size(_)) => return ParsedEntry::KeyAndValuesLen(key, values_len),
+    };
+
+    ParsedEntry::KeyAndValues(key, values, buf)
+}
+
+fn align_slice_to(alignment: usize, data: &[u8]) -> Option<&[u8]> {
+    data.get(data.as_ptr().align_offset(alignment)..)
 }
