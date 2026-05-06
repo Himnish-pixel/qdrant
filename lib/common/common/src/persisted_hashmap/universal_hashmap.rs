@@ -5,7 +5,7 @@ use std::path::Path;
 
 use aligned_vec::AVec;
 use ph::fmph::Function;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{ConvertError, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{BucketOffset, Header, ValuesLen};
 use crate::generic_consts::{Random, Sequential};
@@ -18,7 +18,7 @@ use crate::universal_io::{
 /// On-disk hash map accessed via [`UniversalRead`].
 pub struct UniversalHashMap<
     K: ?Sized,
-    V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 > {
     reader: R,
@@ -31,7 +31,7 @@ pub struct UniversalHashMap<
 
 impl<
     K: Key + ?Sized + PartialEq,
-    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 > UniversalHashMap<K, V, R>
 {
@@ -177,7 +177,7 @@ impl<
 
         let align = K::ALIGN.max(size_of::<ValuesLen>()).max(size_of::<V>());
         let mut buf = AVec::<u8>::new(align);
-        let mut state = State::default();
+        let mut entry_parser = EntryParser::default();
 
         let iter = OrderingIterator::new(
             self.reader
@@ -190,11 +190,11 @@ impl<
 
             let mut view: &[u8] = &buf;
             loop {
-                match state.parse::<K, V>(view, PartialEntryKind::KeyAndValues(0)) {
+                match entry_parser.parse(view, PartialEntryKind::KeyAndValues(0)) {
                     Ok((PartialEntry::KeyAndValues(key, values), data)) => {
                         f(key, values)?;
                         view = data;
-                        state.reset();
+                        entry_parser = EntryParser::default();
                     }
                     Ok(_) => unreachable!("requested KeyAndValues kind"),
                     Err(ReadError::Incomplete) => break,
@@ -288,7 +288,7 @@ fn parse_entry_offset(data: &[u8]) -> Result<BucketOffset> {
 struct SparsePipeline<'m, 'k, Meta, K, V, R>
 where
     K: Key + ?Sized + 'k,
-    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 {
     map: &'m UniversalHashMap<K, V, R>,
@@ -303,7 +303,7 @@ where
 impl<'m, 'k, Meta, K, V, R> SparsePipeline<'m, 'k, Meta, K, V, R>
 where
     K: Key + ?Sized + 'k + PartialEq,
-    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout + bytemuck::Pod,
+    V: Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 {
     fn new(map: &'m UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
@@ -361,7 +361,7 @@ where
                         buf: Vec::new(),
                         expected_len: self.entry_read_size_est,
                         requested_key: None,
-                        parse_state: State::default(),
+                        parse_state: EntryParser::default(),
                     };
                     range = ReadRange {
                         byte_offset,
@@ -409,7 +409,7 @@ where
                         buf: Vec::new(),
                         expected_len: self.entry_read_size_est,
                         requested_key: Some(requested_key),
-                        parse_state: State::default(),
+                        parse_state: EntryParser::default(),
                     },
                 });
             }
@@ -493,7 +493,7 @@ enum EntryState<'a, K: Key + ?Sized> {
         buf: Vec<u8>,
         expected_len: u64,
         requested_key: Option<&'a K>,
-        parse_state: State,
+        parse_state: EntryParser,
     },
 }
 
@@ -532,11 +532,12 @@ enum PartialEntry<'a, K: Key + ?Sized, V> {
     KeyAndValues(&'a K, &'a [V]),
 }
 
+/// Streaming entry parser.
 /// Parsing state for one entry. Persists across calls to [`State::parse`] so
 /// that the streaming key parse and the success-only [`State::read_key`] don't
 /// re-scan bytes that have already been searched.
 #[derive(Default)]
-struct State {
+struct EntryParser {
     /// Size in bytes of the parsed key (set once the key is fully parsed).
     key_size: Option<usize>,
     /// `buf.len()` last seen. Tells [`Key::from_bytes_streaming`] how many
@@ -544,23 +545,19 @@ struct State {
     searched_up_to: usize,
 }
 
-impl State {
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
+impl EntryParser {
     /// Parse an entry from `buf` according to `kind`. Returns the parsed entry
     /// and the leftover slice on success. On `Incomplete`, mutates `self` so a
     /// follow-up call with a larger `buf` can resume without re-scanning.
-    fn parse<'a, K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>(
+    fn parse<'a, K: Key + ?Sized, V: FromBytes + Immutable + IntoBytes + KnownLayout>(
         &mut self,
         buf: &'a [u8],
         kind: PartialEntryKind,
     ) -> ReadResult<(PartialEntry<'a, K, V>, &'a [u8])> {
         // padding            padding                padding
         // ####### [ key... ] ####### [ values_len ] ####### [ values... ]
-        // ^                  ^                      ^
         let entry_data = advance_slice_to_align(K::ALIGN, buf)?;
+
         let key_size = self.parse_key_size::<K>(buf, entry_data)?;
 
         if matches!(kind, PartialEntryKind::KeyOnly) {
@@ -571,11 +568,10 @@ impl State {
         // The writer pads the key tail and the values_len tail to a multiple
         // of size_of::<V>() (not to the natural alignment of the trailing
         // field). Mirror that here.
-        let v_size = size_of::<V>();
-        let data = advance_slice_by(entry_data, key_size.next_multiple_of(v_size))?;
+        let data = advance_slice_by(entry_data, key_size.next_multiple_of(size_of::<V>()))?;
         let (&values_len, data) = ValuesLen::ref_from_prefix(data)?;
         let values_len_pad =
-            size_of::<ValuesLen>().next_multiple_of(v_size) - size_of::<ValuesLen>();
+            size_of::<ValuesLen>().next_multiple_of(size_of::<V>()) - size_of::<ValuesLen>();
         let data = advance_slice_by(data, values_len_pad)?;
 
         if matches!(kind, PartialEntryKind::KeyAndValuesLen) {
@@ -629,4 +625,65 @@ fn advance_slice_by(data: &[u8], by: usize) -> ReadResult<&[u8]> {
 }
 fn advance_slice_to_align(align: usize, data: &[u8]) -> ReadResult<&[u8]> {
     advance_slice_by(data, data.as_ptr().align_offset(align))
+}
+
+enum PartialEntry2<'a, K: Key + ?Sized, V> {
+    Invalid,
+    NoKey,
+    Key(&'a K),
+    KeyAndValuesLen(&'a K, u32),
+    KeyAndValues(&'a K, &'a [V], &'a [u8]),
+}
+
+fn parse_entry<'a, K: Key + ?Sized, V: FromBytes + Immutable + IntoBytes + KnownLayout>(
+    buf: &'a [u8],
+) -> PartialEntry2<'a, K, V> {
+    // ┌─1:pad─┬────2:key─────┬─3:pad─┬─4:len─┬─5:pad─┬─────6:vals─────┐
+    // │ · · · │ "abcdef\xFF" │ · · · │   5   │ · · · │ 10 20 30 40 50 │
+    // └───────┴──────────────┴───────┴───────┴───────┴────────────────┘
+
+    // 1. padding for the key
+    let Some(buf) = advance_slice_to_align2(K::ALIGN, buf) else {
+        return PartialEntry2::NoKey;
+    };
+
+    // 2. key
+    let key = match K::from_bytes_streaming(buf, 0) {
+        Ok(k) => k,
+        Err(ReadError::Incomplete) => return PartialEntry2::NoKey,
+        Err(ReadError::Invalid) => return PartialEntry2::Invalid,
+    };
+    let Some(buf) = buf.get(key.write_bytes()..) else {
+        return PartialEntry2::Key(key);
+    };
+
+    // 3. padding for values_len
+    let Some(buf) = advance_slice_to_align2(size_of::<ValuesLen>(), buf) else {
+        return PartialEntry2::Key(key);
+    };
+
+    // 4. values_len
+    let (&values_len, buf) = match ValuesLen::ref_from_prefix(buf) {
+        Ok(v) => v,
+        Err(ConvertError::Alignment(_)) => return PartialEntry2::Invalid,
+        Err(ConvertError::Size(_)) => return PartialEntry2::Key(key),
+    };
+
+    // 5. padding for values
+    let Some(buf) = advance_slice_to_align2(size_of::<V>(), buf) else {
+        return PartialEntry2::KeyAndValuesLen(key, values_len);
+    };
+
+    // 6. values
+    let (values, buf) = match <[V]>::ref_from_prefix_with_elems(buf, values_len as usize) {
+        Ok(v) => v,
+        Err(ConvertError::Alignment(_)) => return PartialEntry2::Invalid,
+        Err(ConvertError::Size(_)) => return PartialEntry2::KeyAndValuesLen(key, values_len),
+    };
+
+    PartialEntry2::KeyAndValues(key, values, buf)
+}
+
+fn advance_slice_to_align2(align: usize, data: &[u8]) -> Option<&[u8]> {
+    data.get(data.as_ptr().align_offset(align)..)
 }
