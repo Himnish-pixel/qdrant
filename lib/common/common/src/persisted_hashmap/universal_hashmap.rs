@@ -7,27 +7,13 @@ use aligned_vec::AVec;
 use ph::fmph::Function;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use super::{BucketOffset, Header, ValuesLen};
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
 use crate::persisted_hashmap::keys::{Key, ReadError, ReadResult};
 use crate::universal_io::{
     OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead, UniversalReadPipeline,
 };
-
-type ValuesLen = u32;
-type BucketOffset = u64;
-
-/// Same on-disk layout as [`super::mmap_hashmap`]'s header.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct Header {
-    key_type: [u8; 8],
-    buckets_pos: u64,
-    buckets_count: u64,
-}
-
-/// How many bytes a single lookup conceptually touches for hardware-counter accounting.
-pub const READ_ENTRY_OVERHEAD: usize = super::mmap_hashmap::READ_ENTRY_OVERHEAD;
 
 /// On-disk hash map accessed via [`UniversalRead`].
 pub struct UniversalHashMap<

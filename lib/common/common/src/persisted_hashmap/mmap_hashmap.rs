@@ -16,11 +16,10 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use super::{BucketOffset, Header, ValuesLen};
 use crate::mmap::{AdviceSetting, Madviseable, open_read_mmap};
 use crate::persisted_hashmap::keys::Key;
 use crate::zeros::WriteZerosExt as _;
-
-type ValuesLen = u32;
 
 /// On-disk hash map backed by a memory-mapped file.
 ///
@@ -49,14 +48,6 @@ pub struct MmapHashMap<K: ?Sized, V: Sized + FromBytes + Immutable + IntoBytes +
     _phantom_value: PhantomData<V>,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct Header {
-    key_type: [u8; 8],
-    buckets_pos: u64,
-    buckets_count: u64,
-}
-
 const PADDING_SIZE: usize = 4096;
 
 pub const BUCKET_OFFSET_OVERHEAD: usize = size_of::<BucketOffset>();
@@ -67,8 +58,6 @@ const SIZE_OF_KEY: usize = size_of::<u64>();
 
 /// How many bytes we need to read from disk to locate an entry.
 pub const READ_ENTRY_OVERHEAD: usize = SIZE_OF_LENGTH_FIELD + SIZE_OF_KEY + BUCKET_OFFSET_OVERHEAD;
-
-type BucketOffset = u64;
 
 impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>
     MmapHashMap<K, V>
