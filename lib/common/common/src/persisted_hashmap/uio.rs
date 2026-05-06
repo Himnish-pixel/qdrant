@@ -175,48 +175,47 @@ where
 
         let align = K::ALIGN.max(size_of::<ValuesLen>()).max(size_of::<V>());
         let mut buf = AVec::<u8>::new(align);
+        // `parse` skips inter-entry padding via the memory pointer's alignment, so
+        // `view.as_ptr() % K::ALIGN` must track the live data's file-offset modulo. To preserve
+        // that across compaction, only drop K::ALIGN-aligned chunks from the front of `buf`;
+        // any sub-K::ALIGN remainder stays as a prefix and `view_start` marks where live
+        // data begins.
+        let mut view_start = 0usize;
 
         let iter = OrderingIterator::new(
             self.storage
                 .read_iter::<Sequential, usize>(range.iter_autochunks::<u8>().enumerate())?,
         );
 
-        eprintln!("got record");
         for record in iter {
-            eprintln!("got record");
             let (_, mini_buf) = record?;
             buf.extend_from_slice(&mini_buf);
 
-            let mut view: &[u8] = &buf;
+            let mut view: &[u8] = &buf[view_start..];
             loop {
                 match PartialEntry::parse(view).unwrap(/* TODO */) {
                     PartialEntry::KeyAndValues(key, values, leftover) => {
                         f(key, values)?;
                         view = leftover;
                     }
-                    k => {
-                        let kind = match k {
-                            PartialEntry::NoKey => "NoKey".to_string(),
-                            PartialEntry::Key(k) => format!("Key(key={k:?})"),
-                            PartialEntry::KeyAndValuesLen(k, l) => {
-                                format!("KeyAndValuesLen(key={k:?}, values_len={l})")
-                            }
-                            PartialEntry::KeyAndValues(k, _, _) => "KeyAndValues".to_string(),
-                        };
-                        eprintln!("Got partial entry {kind}, so will request more data");
-                        break;
-                    }
+                    _ => break,
                 }
             }
 
             let remaining = view.len();
-            let consumed = buf.len() - remaining;
-            buf.copy_within(consumed.., 0);
-            buf.truncate(remaining);
+            view_start = buf.len() - remaining;
+
+            // Compact: drop a K::ALIGN-aligned prefix from `buf`, keeping the rest (and the
+            // alignment invariant) intact.
+            let drop_len = view_start - view_start % K::ALIGN;
+            if drop_len > 0 {
+                buf.copy_within(drop_len.., 0);
+                buf.truncate(buf.len() - drop_len);
+                view_start -= drop_len;
+            }
         }
 
-        if !buf.is_empty() {
-            // eprintln!("{}", String::from_utf8_lossy(&buf));
+        if buf.len() > view_start {
             return Err(uio_data_err("Trailing bytes left after parsing all entries").into());
         }
 
@@ -436,7 +435,9 @@ where
                         meta: entry.meta,
                         state: EntryState::ReadingEntry {
                             byte_offset,
-                            expected_len: (buf.len() as u64)
+                            // `+ 1` so the size strictly grows when `buf.len()` is already a
+                            // power of two; otherwise the next refill reads 0 bytes and loops.
+                            expected_len: (buf.len() as u64 + 1)
                                 .next_power_of_two()
                                 .max(K::VALUE_SIZE_EST as u64),
                             buf,
