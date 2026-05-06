@@ -177,9 +177,7 @@ impl<
 
         let align = K::ALIGN.max(size_of::<ValuesLen>()).max(size_of::<V>());
         let mut buf = AVec::<u8>::new(align);
-        let mut buf_pos = 0;
-
-        let mut state = State { key_size: None };
+        let mut state = State::default();
 
         let iter = OrderingIterator::new(
             self.reader
@@ -192,17 +190,14 @@ impl<
 
             let mut view: &[u8] = &buf;
             loop {
-                match parse_entry(view, &mut state, buf_pos) {
-                    Ok((data, key, values)) => {
+                match state.parse::<K, V>(view, PartialEntryKind::KeyAndValues(0)) {
+                    Ok((PartialEntry::KeyAndValues(key, values), data)) => {
                         f(key, values)?;
                         view = data;
-                        state.key_size = None;
-                        buf_pos = 0;
+                        state.reset();
                     }
-                    Err(ReadError::Incomplete) => {
-                        buf_pos = view.len();
-                        break;
-                    }
+                    Ok(_) => unreachable!("requested KeyAndValues kind"),
+                    Err(ReadError::Incomplete) => break,
                     Err(ReadError::Invalid) => {
                         return Err(uio_data_err("Failed to parse entry from bytes").into());
                     }
@@ -285,51 +280,6 @@ fn parse_entry_offset(data: &[u8]) -> Result<BucketOffset> {
     ))
 }
 
-/// Single-shot parse of `data` according to `kind`. Mirrors the layout
-/// understood by [`parse_entry`] but for a buffer that's expected to start at
-/// the entry. On `Err`, the returned `u64` is the total entry length needed
-/// (or a heuristic upper bound when the key isn't yet parseable) — used by
-/// [`SparsePipeline`] to schedule a follow-up read.
-fn parse_partial_entry<
-    K: Key + ?Sized,
-    V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout,
->(
-    kind: PartialEntryKind,
-    data: &[u8],
-) -> Result<PartialEntry<'_, K, V>, u64> {
-    let Some(key) = K::from_bytes(data) else {
-        return Err((data.len() as u64)
-            .next_power_of_two()
-            .max(K::VALUE_SIZE_EST as u64));
-    };
-    if matches!(kind, PartialEntryKind::KeyOnly) {
-        return Ok(PartialEntry::KeyOnly(key));
-    }
-
-    let v_size = size_of::<V>();
-    let values_len_at = key.write_bytes().next_multiple_of(v_size);
-    let values_len_end = values_len_at + size_of::<ValuesLen>();
-    if data.len() < values_len_end {
-        return Err(values_len_end as u64);
-    }
-    let values_len =
-        ValuesLen::from_le_bytes(data[values_len_at..values_len_end].try_into().unwrap());
-
-    if matches!(kind, PartialEntryKind::KeyAndValuesLen) {
-        return Ok(PartialEntry::KeyAndValuesLen(key, values_len));
-    }
-
-    let values_at = values_len_end.next_multiple_of(v_size);
-    let values_end = values_at + values_len as usize * v_size;
-    if data.len() < values_end {
-        return Err(values_end as u64);
-    }
-    Ok(PartialEntry::KeyAndValues(
-        key,
-        <[V]>::ref_from_bytes(&data[values_at..values_end]).unwrap(),
-    ))
-}
-
 /// State machine driver for [`UniversalHashMap::for_each_sparse_impl2`]. Owns
 /// the queue of entries waiting for an I/O slot and exposes:
 /// [`refill`](Self::refill) — produce the next entry to schedule —
@@ -389,6 +339,7 @@ where
                     buf,
                     expected_len,
                     requested_key: _,
+                    parse_state: _,
                 } => {
                     let range = ReadRange::new(
                         byte_offset.saturating_add(buf.len() as u64),
@@ -410,6 +361,7 @@ where
                         buf: Vec::new(),
                         expected_len: self.entry_read_size_est,
                         requested_key: None,
+                        parse_state: State::default(),
                     };
                     range = ReadRange {
                         byte_offset,
@@ -457,6 +409,7 @@ where
                         buf: Vec::new(),
                         expected_len: self.entry_read_size_est,
                         requested_key: Some(requested_key),
+                        parse_state: State::default(),
                     },
                 });
             }
@@ -466,33 +419,44 @@ where
                 mut buf,
                 expected_len: _,
                 requested_key,
+                mut parse_state,
             } => {
                 buf.extend_from_slice(data);
 
-                // For key requests, verify the stored key as soon as it's parseable.
+                let parse_result = parse_state.parse::<K, V>(&buf, self.entry_kind);
+
+                // Verify the requested key against the stored key as soon as
+                // the key is parseable; bail early on mismatch.
                 let mut unverified_key = requested_key;
-                if let Some(req_key) = requested_key {
-                    if let Some(stored_key) = K::from_bytes(&buf) {
+                if let Some(req_key) = unverified_key {
+                    if parse_state.key_size.is_some() {
+                        let stored_key = parse_state
+                            .read_key::<K>(&buf)
+                            .map_err(|_| uio_data_err("Failed to read stored key"))?;
                         if req_key != stored_key {
-                            // Mismatch → no entry to return; skip further reads.
                             f(entry.meta, None)?;
                             return Ok(());
                         }
-                        // Match → no need to re-check on subsequent follow-up reads.
                         unverified_key = None;
                     }
                 }
 
-                match parse_partial_entry::<K, V>(self.entry_kind, &buf) {
-                    Ok(parsed) => f(entry.meta, Some(parsed))?,
-                    // Need more bytes: requeue with the new expected length.
-                    Err(expected_len) => self.to_schedule.push(Entry {
+                match parse_result {
+                    Ok((parsed, _)) => f(entry.meta, Some(parsed))?,
+                    Err(ReadError::Invalid) => {
+                        return Err(uio_data_err("Failed to parse entry from bytes").into());
+                    }
+                    // Need more bytes: requeue with a heuristically grown length.
+                    Err(ReadError::Incomplete) => self.to_schedule.push(Entry {
                         meta: entry.meta,
                         state: EntryState::ReadingEntry {
                             byte_offset,
+                            expected_len: (buf.len() as u64)
+                                .next_power_of_two()
+                                .max(K::VALUE_SIZE_EST as u64),
                             buf,
-                            expected_len,
                             requested_key: unverified_key,
+                            parse_state,
                         },
                     }),
                 }
@@ -529,6 +493,7 @@ enum EntryState<'a, K: Key + ?Sized> {
         buf: Vec<u8>,
         expected_len: u64,
         requested_key: Option<&'a K>,
+        parse_state: State,
     },
 }
 
@@ -567,8 +532,96 @@ enum PartialEntry<'a, K: Key + ?Sized, V> {
     KeyAndValues(&'a K, &'a [V]),
 }
 
+/// Parsing state for one entry. Persists across calls to [`State::parse`] so
+/// that the streaming key parse and the success-only [`State::read_key`] don't
+/// re-scan bytes that have already been searched.
+#[derive(Default)]
 struct State {
+    /// Size in bytes of the parsed key (set once the key is fully parsed).
     key_size: Option<usize>,
+    /// `buf.len()` last seen. Tells [`Key::from_bytes_streaming`] how many
+    /// leading bytes have already been searched for the key terminator.
+    searched_up_to: usize,
+}
+
+impl State {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Parse an entry from `buf` according to `kind`. Returns the parsed entry
+    /// and the leftover slice on success. On `Incomplete`, mutates `self` so a
+    /// follow-up call with a larger `buf` can resume without re-scanning.
+    fn parse<'a, K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>(
+        &mut self,
+        buf: &'a [u8],
+        kind: PartialEntryKind,
+    ) -> ReadResult<(PartialEntry<'a, K, V>, &'a [u8])> {
+        // padding            padding                padding
+        // ####### [ key... ] ####### [ values_len ] ####### [ values... ]
+        // ^                  ^                      ^
+        let entry_data = advance_slice_to_align(K::ALIGN, buf)?;
+        let key_size = self.parse_key_size::<K>(buf, entry_data)?;
+
+        if matches!(kind, PartialEntryKind::KeyOnly) {
+            let remaining = advance_slice_by(entry_data, key_size)?;
+            return Ok((PartialEntry::KeyOnly(self.read_key(entry_data)?), remaining));
+        }
+
+        // The writer pads the key tail and the values_len tail to a multiple
+        // of size_of::<V>() (not to the natural alignment of the trailing
+        // field). Mirror that here.
+        let v_size = size_of::<V>();
+        let data = advance_slice_by(entry_data, key_size.next_multiple_of(v_size))?;
+        let (&values_len, data) = ValuesLen::ref_from_prefix(data)?;
+        let values_len_pad =
+            size_of::<ValuesLen>().next_multiple_of(v_size) - size_of::<ValuesLen>();
+        let data = advance_slice_by(data, values_len_pad)?;
+
+        if matches!(kind, PartialEntryKind::KeyAndValuesLen) {
+            let entry = PartialEntry::KeyAndValuesLen(self.read_key(entry_data)?, values_len);
+            return Ok((entry, data));
+        }
+
+        let (values, data) = <[V]>::ref_from_prefix_with_elems(data, values_len as usize)?;
+        let entry = PartialEntry::KeyAndValues(self.read_key(entry_data)?, values);
+        Ok((entry, data))
+    }
+
+    /// Read (or recall) the entry's key length, advancing the streaming key
+    /// parse only if it hasn't already finished.
+    fn parse_key_size<K: Key + ?Sized>(
+        &mut self,
+        buf: &[u8],
+        entry_data: &[u8],
+    ) -> ReadResult<usize> {
+        if let Some(s) = self.key_size {
+            return Ok(s);
+        }
+        let entry_start_offset = buf.len() - entry_data.len();
+        let prev_size = self.searched_up_to.saturating_sub(entry_start_offset);
+        match K::from_bytes_streaming(entry_data, prev_size) {
+            Ok(key) => {
+                let s = key.write_bytes();
+                self.key_size = Some(s);
+                Ok(s)
+            }
+            Err(e) => {
+                self.searched_up_to = buf.len();
+                Err(e)
+            }
+        }
+    }
+
+    /// Materialize a `&K` reference. Only call after [`Self::parse`] has
+    /// populated `key_size` (i.e. on success paths or after a verify check).
+    fn read_key<'a, K: Key + ?Sized>(&self, buf: &'a [u8]) -> ReadResult<&'a K> {
+        let entry_data = advance_slice_to_align(K::ALIGN, buf)?;
+        let key_size = self
+            .key_size
+            .expect("read_key called before the key was parsed");
+        K::from_bytes(&entry_data[..key_size]).ok_or(ReadError::Invalid)
+    }
 }
 
 fn advance_slice_by(data: &[u8], by: usize) -> ReadResult<&[u8]> {
@@ -576,41 +629,4 @@ fn advance_slice_by(data: &[u8], by: usize) -> ReadResult<&[u8]> {
 }
 fn advance_slice_to_align(align: usize, data: &[u8]) -> ReadResult<&[u8]> {
     advance_slice_by(data, data.as_ptr().align_offset(align))
-}
-
-fn parse_entry<'a, K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>(
-    buf: &'a [u8],
-    state: &mut State,
-    new_pos: usize,
-) -> ReadResult<(&'a [u8], &'a K, &'a [V])> {
-    // padding            padding                padding
-    // ####### [ key... ] ####### [ values_len ] ####### [ values... ]
-    // ^                  ^                      ^
-    let data = advance_slice_to_align(K::ALIGN, buf)?;
-    let entry_start_offset = buf.len() - data.len();
-
-    let key_size;
-    match state.key_size {
-        Some(s) => key_size = s,
-        None => {
-            let key = K::from_bytes_streaming(data, new_pos.saturating_sub(entry_start_offset))?;
-            key_size = key.write_bytes();
-            state.key_size = Some(key_size);
-        }
-    }
-
-    // The writer pads the key tail and the values_len tail to a multiple
-    // of size_of::<V>() (not to the natural alignment of the trailing
-    // field). Mirror that here.
-    let v_size = size_of::<V>();
-    let data = advance_slice_by(data, key_size.next_multiple_of(v_size))?;
-    let (&values_len, data) = ValuesLen::ref_from_prefix(data)?;
-    let values_len_pad = size_of::<ValuesLen>().next_multiple_of(v_size) - size_of::<ValuesLen>();
-    let data = advance_slice_by(data, values_len_pad)?;
-    let (values, data) = <[V]>::ref_from_prefix_with_elems(data, values_len as usize)?;
-
-    let key = K::from_bytes(&buf[entry_start_offset..buf.len() - data.len()])
-        .ok_or(ReadError::Invalid)?;
-
-    Ok((data, key, values))
 }
