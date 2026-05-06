@@ -1,9 +1,6 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::io;
 use std::ops::Range;
-
-use slab::Slab;
 
 use crate::generic_consts::AccessPattern;
 use crate::universal_io::read::UniversalReadPipeline;
@@ -11,32 +8,29 @@ use crate::universal_io::simple_disk_cache::BLOCK_SIZE;
 use crate::universal_io::simple_disk_cache::file::to_block_range;
 use crate::universal_io::{self, DiskCache, ReadRange, UniversalIoError, UniversalRead};
 
-type SlotId = usize;
-
-struct PipelinedMeta<'file, Meta, R> {
+struct RemoteMeta<'file, Meta, R> {
     file: &'file DiskCache<R>,
     blocks_range: Range<u32>,
     read_range: ReadRange,
     meta: Meta,
 }
 
-pub struct DiskCachePipeline<'a, T, Meta, R>
+pub struct DiskCachePipeline<'file, T, Meta, R>
 where
-    R: UniversalRead<u8> + 'a,
+    R: UniversalRead<u8> + 'file,
 {
-    remote_pipeline: OnceCell<R::ReadPipeline<'a, SlotId>>,
-    pipelined_metas: Slab<PipelinedMeta<'a, Meta, R>>,
-    result: Option<(Meta, &'a [T])>,
+    remote_pipeline: OnceCell<R::ReadPipeline<'file, RemoteMeta<'file, Meta, R>>>,
+    result: Option<(Meta, &'file [T])>,
 }
 
-impl<'a, T, Meta, R> DiskCachePipeline<'a, T, Meta, R>
+impl<'file, T, Meta, R> DiskCachePipeline<'file, T, Meta, R>
 where
     T: bytemuck::Pod,
-    R: UniversalRead<u8> + 'a,
+    R: UniversalRead<u8> + 'file,
 {
     fn get_or_init_remote_pipeline(
         &mut self,
-    ) -> universal_io::Result<&mut R::ReadPipeline<'a, usize>> {
+    ) -> universal_io::Result<&mut R::ReadPipeline<'file, RemoteMeta<'file, Meta, R>>> {
         if self.remote_pipeline.get().is_none() {
             let remote = R::ReadPipeline::new()?;
             // We just observed the cell as empty and hold `&mut self`, so set cannot fail.
@@ -45,24 +39,21 @@ where
         Ok(self.remote_pipeline.get_mut().expect("just initialized"))
     }
 
-    fn wait_for_remote(&mut self) -> universal_io::Result<Option<(Meta, &'a [T])>> {
+    fn wait_for_remote(&mut self) -> universal_io::Result<Option<(Meta, &'file [T])>> {
         let Some(remote_pipeline) = self.remote_pipeline.get_mut() else {
             return Ok(None);
         };
 
-        let Some((slot_id, bytes)) = remote_pipeline.wait()? else {
+        let Some((meta, bytes)) = remote_pipeline.wait()? else {
             return Ok(None);
         };
 
-        let PipelinedMeta {
+        let RemoteMeta {
             file,
             blocks_range,
             read_range,
             meta,
-        } = self
-            .pipelined_metas
-            .try_remove(slot_id)
-            .ok_or_else(|| io::Error::other("file slot not found"))?;
+        } = meta;
 
         let local = file.local_state()?;
 
@@ -76,8 +67,8 @@ where
     }
 }
 
-impl<'a, T, Meta, Remote> UniversalReadPipeline<'a, T, Meta>
-    for DiskCachePipeline<'a, T, Meta, Remote>
+impl<'file, T, Meta, Remote> UniversalReadPipeline<'file, T, Meta>
+    for DiskCachePipeline<'file, T, Meta, Remote>
 where
     T: bytemuck::Pod + Copy + 'static,
     Remote: UniversalRead<u8>,
@@ -87,7 +78,6 @@ where
     fn new() -> crate::universal_io::Result<Self> {
         Ok(Self {
             remote_pipeline: OnceCell::new(),
-            pipelined_metas: Slab::new(),
             result: None,
         })
     }
@@ -103,7 +93,7 @@ where
     fn schedule<P: AccessPattern>(
         &mut self,
         meta: Meta,
-        file: &'a DiskCache<Remote>,
+        file: &'file DiskCache<Remote>,
         range: crate::universal_io::ReadRange,
     ) -> crate::universal_io::Result<()> {
         // Short-circuit if range is empty
@@ -145,21 +135,22 @@ where
             length: fetch_length.min(max_length) as u64,
         };
 
-        let pipelined_meta = PipelinedMeta {
+        let pipelined_meta = RemoteMeta {
             file,
             blocks_range,
             read_range: range,
             meta,
         };
-        let slot_id = self.pipelined_metas.insert(pipelined_meta);
 
         let remote_pipeline = self.get_or_init_remote_pipeline()?;
-        remote_pipeline.schedule::<P>(slot_id, &file.remote, blocks_byte_range)?;
+        remote_pipeline.schedule::<P>(pipelined_meta, &file.remote, blocks_byte_range)?;
 
         Ok(())
     }
 
-    fn wait(&mut self) -> crate::universal_io::Result<Option<(Meta, std::borrow::Cow<'a, [T]>)>> {
+    fn wait(
+        &mut self,
+    ) -> crate::universal_io::Result<Option<(Meta, std::borrow::Cow<'file, [T]>)>> {
         if let Some((meta, slice)) = self.result.take() {
             return Ok(Some((meta, Cow::Borrowed(slice))));
         }
