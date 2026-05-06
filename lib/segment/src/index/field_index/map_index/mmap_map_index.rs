@@ -11,7 +11,8 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::fs::{atomic_save_json, clear_disk_cache, read_json};
 use common::mmap::create_and_ensure_length;
-use common::persisted_hashmap::{Key, MmapHashMap, READ_ENTRY_OVERHEAD, UniversalHashMap};
+use common::persisted_hashmap;
+use common::persisted_hashmap::{Key, READ_ENTRY_OVERHEAD, UniversalHashMap};
 use common::stored_bitslice::MmapBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFile, OpenOptions};
@@ -152,7 +153,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             },
         )?;
 
-        MmapHashMap::create(
+        persisted_hashmap::write(
             &hashmap_path,
             values_to_points
                 .iter()

@@ -1,6 +1,7 @@
 mod keys;
 mod mmap_hashmap;
 mod universal_hashmap;
+mod write;
 
 #[cfg(test)]
 mod tests;
@@ -10,6 +11,7 @@ mod universal_hashmap_tests;
 pub use keys::Key;
 pub use mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
 pub use universal_hashmap::UniversalHashMap;
+pub use write::write;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 type ValuesLen = u32;
