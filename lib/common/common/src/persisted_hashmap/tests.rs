@@ -4,8 +4,8 @@ use std::hash::Hash;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use crate::persisted_hashmap::keys::Key;
-use crate::persisted_hashmap::mmap_hashmap::{MmapHashMap, gen_ident, gen_map, repeat_until};
+use super::test_utils::{gen_ident, gen_map, repeat_until};
+use super::{Key, MmapHashMap, write};
 
 #[test]
 fn test_mmap_hash() {
@@ -23,7 +23,7 @@ fn test_mmap_hash_impl<K: Key + ?Sized, K1: Ord + Hash>(
     let tmpdir = tempfile::Builder::new().tempdir().unwrap();
 
     let map = gen_map(&mut rng, generator.clone(), 1000);
-    MmapHashMap::<K, u32>::create(
+    write(
         &tmpdir.path().join("map"),
         map.iter().map(|(k, v)| (as_ref(k), v.iter().copied())),
     )
@@ -72,7 +72,7 @@ fn test_mmap_hash_impl_u64_value() {
         map.insert(key, (0..100).map(|_| rng.random_range(0..=1000)).collect());
     }
 
-    MmapHashMap::<i64, u64>::create(
+    write(
         &tmpdir.path().join("map"),
         map.iter().map(|(k, v)| (k, v.iter().copied())),
     )
@@ -102,7 +102,7 @@ fn test_mmap_hash_impl_u128_value() {
         (0..100).map(|_| rng.random_range(0..=1000)).collect(),
     );
 
-    MmapHashMap::<u128, u32>::create(
+    write(
         &tmpdir.path().join("map"),
         map.iter().map(|(k, v)| (k, v.iter().copied())),
     )

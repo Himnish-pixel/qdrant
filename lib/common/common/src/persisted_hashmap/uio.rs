@@ -5,23 +5,23 @@ use std::path::Path;
 
 use aligned_vec::AVec;
 use ph::fmph::Function;
-use zerocopy::{ConvertError, FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::{BucketOffset, Header, ValuesLen};
+use super::{BucketOffset, Header, Key, PartialEntry, PartialEntryKind, ValuesLen};
 use crate::generic_consts::{Random, Sequential};
 use crate::iterator_ext::ordering_iterator::OrderingIterator;
-use crate::persisted_hashmap::keys::{Key, ReadError};
 use crate::universal_io::{
     OpenOptions, ReadRange, Result, UniversalIoError, UniversalRead, UniversalReadPipeline,
 };
 
 /// On-disk hash map accessed via [`UniversalRead`].
-pub struct UniversalHashMap<
-    K: ?Sized,
-    V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout,
-    R: UniversalRead<u8>,
-> {
-    reader: R,
+pub struct UniversalHashMap<K, V, S>
+where
+    K: Key + ?Sized,
+    V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
+    S: UniversalRead<u8>,
+{
+    storage: S,
     header: Header,
     phf: Function,
     /// Absolute byte offset where entry data begins (right after the bucket offsets array).
@@ -29,18 +29,18 @@ pub struct UniversalHashMap<
     phantom: PhantomData<(V, K)>,
 }
 
-impl<
-    K: Key + ?Sized + PartialEq,
+impl<'key, K, V, S> UniversalHashMap<K, V, S>
+where
+    K: Key + ?Sized + 'key,
     V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
-    R: UniversalRead<u8>,
-> UniversalHashMap<K, V, R>
+    S: UniversalRead<u8>,
 {
     /// Load the hash map from file.
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let reader = R::open(path, options)?;
+        let storage = S::open(path, options)?;
 
         // 1. Read header.
-        let header_bytes = reader.read::<Sequential>(ReadRange {
+        let header_bytes = storage.read::<Sequential>(ReadRange {
             byte_offset: 0,
             length: size_of::<Header>() as u64,
         })?;
@@ -64,7 +64,7 @@ impl<
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "buckets_pos before header end")
             })?;
-        let phf_bytes = reader.read::<Sequential>(ReadRange {
+        let phf_bytes = storage.read::<Sequential>(ReadRange {
             byte_offset: phf_region_start,
             length: phf_region_len,
         })?;
@@ -73,8 +73,8 @@ impl<
         let entries_start =
             header.buckets_pos + header.buckets_count * size_of::<BucketOffset>() as u64;
 
-        Ok(Self {
-            reader,
+        Ok(UniversalHashMap {
+            storage,
             header,
             phf,
             entries_start,
@@ -92,7 +92,7 @@ impl<
         mut f: impl FnMut(&K) -> Result<(), E>,
     ) -> Result<(), E> {
         let bucket_count = self.header.buckets_count as usize;
-        let bytes = self.reader.read::<Sequential>(ReadRange {
+        let bytes = self.storage.read::<Sequential>(ReadRange {
             byte_offset: self.header.buckets_pos,
             length: (bucket_count * size_of::<BucketOffset>()) as u64,
         })?;
@@ -105,6 +105,7 @@ impl<
             PartialEntryKind::KeyOnly,
             offsets.into_iter().map(|o| ((), Request::Offset(o))),
             |(), entry| {
+                // TODO: use method
                 let key = match entry {
                     Some(
                         PartialEntry::Key(k)
@@ -118,16 +119,13 @@ impl<
         )
     }
 
-    pub fn batch_with_entry<'k, Meta, E: From<UniversalIoError>>(
+    pub fn batch_with_entry<Meta, E: From<UniversalIoError>>(
         &self,
-        keys: impl IntoIterator<Item = (Meta, &'k K)>,
+        keys: impl IntoIterator<Item = (Meta, &'key K)>,
         mut f: impl FnMut(Meta, Option<&[V]>) -> Result<(), E>,
-    ) -> Result<(), E>
-    where
-        K: 'k,
-    {
+    ) -> Result<(), E> {
         self.for_each_sparse(
-            PartialEntryKind::KeyAndValues(1),
+            PartialEntryKind::KeyAndValues,
             keys.into_iter()
                 .map(|(meta, key)| (meta, Request::Key(key))),
             |meta, entry| {
@@ -140,24 +138,21 @@ impl<
         )
     }
 
-    fn for_each_sparse<'a, Meta, E: From<UniversalIoError>>(
+    fn for_each_sparse<Meta, E: From<UniversalIoError>>(
         &self,
         entry_kind: PartialEntryKind,
-        requests: impl Iterator<Item = (Meta, Request<'a, K>)>,
+        requests: impl Iterator<Item = (Meta, Request<'key, K>)>,
         mut f: impl FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
-    ) -> Result<(), E>
-    where
-        K: 'a,
-    {
+    ) -> Result<(), E> {
         let mut sparse = SparsePipeline::new(self, entry_kind)?;
-        let mut pipeline = R::ReadPipeline::<'_, Entry<'a, Meta, K>>::new()?;
+        let mut pipeline = S::ReadPipeline::<'_, Entry<'key, Meta, K>>::new()?;
         let mut requests = requests.into_iter();
         loop {
             while pipeline.can_schedule() {
                 let Some((entry, range)) = sparse.refill(&mut requests, &mut f)? else {
                     break;
                 };
-                pipeline.schedule::<Random>(entry, &self.reader, range)?;
+                pipeline.schedule::<Random>(entry, &self.storage, range)?;
             }
             let Some((entry, data)) = pipeline.wait()? else {
                 break;
@@ -171,7 +166,7 @@ impl<
         &self,
         mut f: impl FnMut(&K, &[V]) -> Result<(), E>,
     ) -> Result<(), E> {
-        let file_len = self.reader.len()?;
+        let file_len = self.storage.len()?;
 
         let range = ReadRange {
             byte_offset: self.entries_start,
@@ -182,26 +177,35 @@ impl<
         let mut buf = AVec::<u8>::new(align);
 
         let iter = OrderingIterator::new(
-            self.reader
+            self.storage
                 .read_iter::<Sequential, usize>(range.iter_autochunks::<u8>().enumerate())?,
         );
 
+        eprintln!("got record");
         for record in iter {
+            eprintln!("got record");
             let (_, mini_buf) = record?;
             buf.extend_from_slice(&mini_buf);
 
             let mut view: &[u8] = &buf;
             loop {
-                match parse_entry::<K, V>(view) {
+                match PartialEntry::parse(view).unwrap(/* TODO */) {
                     PartialEntry::KeyAndValues(key, values, leftover) => {
                         f(key, values)?;
                         view = leftover;
                     }
-                    PartialEntry::Invalid => {
-                        return Err(uio_data_err("Failed to parse entry from bytes").into());
+                    k => {
+                        let kind = match k {
+                            PartialEntry::NoKey => "NoKey".to_string(),
+                            PartialEntry::Key(k) => format!("Key(key={k:?})"),
+                            PartialEntry::KeyAndValuesLen(k, l) => {
+                                format!("KeyAndValuesLen(key={k:?}, values_len={l})")
+                            }
+                            PartialEntry::KeyAndValues(k, _, _) => "KeyAndValues".to_string(),
+                        };
+                        eprintln!("Got partial entry {kind}, so will request more data");
+                        break;
                     }
-                    // NoKey | Key | KeyAndValuesLen — need more bytes.
-                    _ => break,
                 }
             }
 
@@ -212,24 +216,20 @@ impl<
         }
 
         if !buf.is_empty() {
+            // eprintln!("{}", String::from_utf8_lossy(&buf));
             return Err(uio_data_err("Trailing bytes left after parsing all entries").into());
         }
 
         Ok(())
     }
 
-    // ── Single-key lookup ───────────────────────────────────────────────
-
     pub fn get(&self, key: &K) -> Result<Option<Vec<V>>> {
         let mut result: Option<Vec<V>> = None;
         self.for_each_sparse(
-            PartialEntryKind::KeyAndValues(1),
+            PartialEntryKind::KeyAndValues,
             std::iter::once(((), Request::Key(key))),
             |(), entry| -> Result<()> {
-                result = entry.map(|e| match e {
-                    PartialEntry::KeyAndValues(_, values, _) => values.to_vec(),
-                    _ => unreachable!(),
-                });
+                result = entry.map(|e| e.values().expect("TODO").to_vec());
                 Ok(())
             },
         )?;
@@ -243,27 +243,21 @@ impl<
             PartialEntryKind::KeyAndValuesLen,
             std::iter::once(((), Request::Key(key))),
             |(), entry| -> Result<()> {
-                result = entry.map(|e| match e {
-                    PartialEntry::KeyAndValuesLen(_, n) => n as usize,
-                    PartialEntry::KeyAndValues(_, vs, _) => vs.len(),
-                    _ => unreachable!(),
-                });
+                result = entry.map(|e| e.values_len().expect("TODO") as usize);
                 Ok(())
             },
         )?;
         Ok(result)
     }
 
-    // ── Cache management ────────────────────────────────────────────────
-
     /// Populate the RAM cache for the backing file.
     pub fn populate(&self) -> Result<()> {
-        self.reader.populate()
+        self.storage.populate()
     }
 
     /// Evict the backing file data from RAM cache.
     pub fn clear_ram_cache(&self) -> Result<()> {
-        self.reader.clear_ram_cache()
+        self.storage.clear_ram_cache()
     }
 }
 
@@ -280,33 +274,34 @@ fn parse_entry_offset(data: &[u8]) -> Result<BucketOffset> {
 
 /// State machine driver for [`UniversalHashMap::for_each_sparse_impl2`]. Owns
 /// the queue of entries waiting for an I/O slot and exposes:
-/// [`refill`](Self::refill) — produce the next entry to schedule —
-/// and [`process`](Self::process) — consume a completed read.
+/// [`Self::refill`] — produce the next entry to schedule —
+/// and [`Self::process`] — consume a completed read.
 /// The caller drives the underlying I/O pipeline.
-struct SparsePipeline<'m, 'k, Meta, K, V, R>
+struct SparsePipeline<'map, 'key, Meta, K, V, R>
 where
-    K: Key + ?Sized + 'k,
+    K: Key + ?Sized + 'key,
     V: Sized + Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 {
-    map: &'m UniversalHashMap<K, V, R>,
+    map: &'map UniversalHashMap<K, V, R>,
+    /// Specifies which entry fields we are interested in. E.g., for
+    /// [`PartialEntryKind::KeyOnly`], read just enough to parse the key
+    /// and skip the values.
     entry_kind: PartialEntryKind,
-    // Entries with a Loading-phase read ready to be scheduled. Filled when we
-    // transition into Loading or need a follow-up read for partially-loaded data.
-    to_schedule: Vec<Entry<'k, Meta, K>>,
+    to_schedule: Vec<Entry<'key, Meta, K>>,
     entry_read_size_est: u64,
     file_len: u64,
 }
 
-impl<'m, 'k, Meta, K, V, R> SparsePipeline<'m, 'k, Meta, K, V, R>
+impl<'map, 'key, Meta, K, V, R> SparsePipeline<'map, 'key, Meta, K, V, R>
 where
-    K: Key + ?Sized + 'k + PartialEq,
+    K: Key + ?Sized + 'key,
     V: Copy + FromBytes + Immutable + IntoBytes + KnownLayout,
     R: UniversalRead<u8>,
 {
-    fn new(map: &'m UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
-        let entry_read_size_est = entry_kind.est_size::<K, V>() as u64;
-        let file_len = map.reader.len()?;
+    fn new(map: &'map UniversalHashMap<K, V, R>, entry_kind: PartialEntryKind) -> Result<Self> {
+        let entry_read_size_est = entry_kind.estimated_size::<K, V>() as u64;
+        let file_len = map.storage.len()?;
         Ok(Self {
             map,
             entry_kind,
@@ -319,9 +314,9 @@ where
     /// Produce the next entry to schedule.
     fn refill<E, F>(
         &mut self,
-        requests: &mut impl Iterator<Item = (Meta, Request<'k, K>)>,
+        requests: &mut impl Iterator<Item = (Meta, Request<'key, K>)>,
         f: &mut F,
-    ) -> Result<Option<(Entry<'k, Meta, K>, ReadRange)>, E>
+    ) -> Result<Option<(Entry<'key, Meta, K>, ReadRange)>, E>
     where
         E: From<UniversalIoError>,
         F: FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
@@ -389,7 +384,12 @@ where
     }
 
     /// Process a completed read result.
-    fn process<E, F>(&mut self, entry: Entry<'k, Meta, K>, data: &[u8], f: &mut F) -> Result<(), E>
+    fn process<E, F>(
+        &mut self,
+        entry: Entry<'key, Meta, K>,
+        data: &[u8],
+        f: &mut F,
+    ) -> Result<(), E>
     where
         E: From<UniversalIoError>,
         F: FnMut(Meta, Option<PartialEntry<'_, K, V>>) -> Result<(), E>,
@@ -413,55 +413,26 @@ where
                 byte_offset,
                 mut buf,
                 expected_len: _,
-                requested_key,
+                mut requested_key,
             } => {
                 buf.extend_from_slice(data);
 
-                let parsed = parse_entry::<K, V>(&buf);
+                let parsed = PartialEntry::parse(&buf).unwrap(/* TODO */);
 
-                // Verify the requested key against the stored key as soon as
-                // the key is parseable; bail early on mismatch.
-                let mut unverified_key = requested_key;
-                if let Some(req_key) = unverified_key {
-                    let stored_key = match parsed {
-                        PartialEntry::Key(k)
-                        | PartialEntry::KeyAndValuesLen(k, _)
-                        | PartialEntry::KeyAndValues(k, _, _) => Some(k),
-                        _ => None,
-                    };
-                    if let Some(stored_key) = stored_key {
-                        if req_key != stored_key {
+                if let Some(key) = requested_key {
+                    if let Some(stored_key) = parsed.key() {
+                        if key != stored_key {
                             f(entry.meta, None)?;
                             return Ok(());
                         }
-                        unverified_key = None;
+                        requested_key = None;
                     }
                 }
 
-                let satisfied = match (self.entry_kind, &parsed) {
-                    (
-                        PartialEntryKind::KeyOnly,
-                        PartialEntry::Key(_)
-                        | PartialEntry::KeyAndValuesLen(_, _)
-                        | PartialEntry::KeyAndValues(_, _, _),
-                    ) => true,
-                    (
-                        PartialEntryKind::KeyAndValuesLen,
-                        PartialEntry::KeyAndValuesLen(_, _) | PartialEntry::KeyAndValues(_, _, _),
-                    ) => true,
-                    (PartialEntryKind::KeyAndValues(_), PartialEntry::KeyAndValues(_, _, _)) => {
-                        true
-                    }
-                    _ => false,
-                };
-
-                match parsed {
-                    PartialEntry::Invalid => {
-                        return Err(uio_data_err("Failed to parse entry from bytes").into());
-                    }
-                    _ if satisfied => f(entry.meta, Some(parsed))?,
-                    // Need more bytes: requeue with a heuristically grown length.
-                    _ => self.to_schedule.push(Entry {
+                if parsed.satisfies_kind(self.entry_kind) {
+                    f(entry.meta, Some(parsed))?;
+                } else {
+                    self.to_schedule.push(Entry {
                         meta: entry.meta,
                         state: EntryState::ReadingEntry {
                             byte_offset,
@@ -469,9 +440,9 @@ where
                                 .next_power_of_two()
                                 .max(K::VALUE_SIZE_EST as u64),
                             buf,
-                            requested_key: unverified_key,
+                            requested_key,
                         },
-                    }),
+                    })
                 }
             }
         }
@@ -512,89 +483,4 @@ enum EntryState<'a, K: Key + ?Sized> {
 enum Request<'a, K: Key + ?Sized> {
     Offset(u64),
     Key(&'a K),
-}
-
-#[derive(Copy, Clone)]
-enum PartialEntryKind {
-    KeyOnly,
-    KeyAndValuesLen,
-    KeyAndValues(u32),
-}
-
-impl PartialEntryKind {
-    fn est_size<K: Key + ?Sized, V>(self) -> usize {
-        let v_size = size_of::<V>();
-        // Upper bound: each component (key, values_len) may be followed by up to
-        // `v_size - 1` bytes of padding before the next component.
-        let key_padded = K::VALUE_SIZE_EST + v_size.saturating_sub(1);
-        let values_len_padded = size_of::<ValuesLen>() + v_size.saturating_sub(1);
-        match self {
-            Self::KeyOnly => K::VALUE_SIZE_EST,
-            Self::KeyAndValuesLen => key_padded + size_of::<ValuesLen>(),
-            Self::KeyAndValues(values_len) => {
-                key_padded + values_len_padded + v_size * (values_len as usize)
-            }
-        }
-    }
-}
-
-enum PartialEntry<'a, K: Key + ?Sized, V> {
-    Invalid,
-    NoKey,
-    Key(&'a K),
-    KeyAndValuesLen(&'a K, u32),
-    KeyAndValues(&'a K, &'a [V], &'a [u8]),
-}
-
-fn parse_entry<'a, K: Key + ?Sized, V: FromBytes + Immutable + IntoBytes + KnownLayout>(
-    buf: &'a [u8],
-) -> PartialEntry<'a, K, V> {
-    // ┌─1:pad─┬────2:key─────┬─3:pad─┬─4:len─┬─5:pad─┬─────6:vals─────┐
-    // │ · · · │ "abcdef\xFF" │ · · · │   5   │ · · · │ 10 20 30 40 50 │
-    // └───────┴──────────────┴───────┴───────┴───────┴────────────────┘
-
-    // 1. padding for the key
-    let Some(buf) = advance_slice_to_align(K::ALIGN, buf) else {
-        return PartialEntry::NoKey;
-    };
-
-    // 2. key
-    let key = match K::from_bytes_streaming(buf, 0) {
-        Ok(k) => k,
-        Err(ReadError::Incomplete) => return PartialEntry::NoKey,
-        Err(ReadError::Invalid) => return PartialEntry::Invalid,
-    };
-    let Some(buf) = buf.get(key.write_bytes()..) else {
-        return PartialEntry::Key(key);
-    };
-
-    // 3. padding for values_len
-    let Some(buf) = advance_slice_to_align(size_of::<ValuesLen>(), buf) else {
-        return PartialEntry::Key(key);
-    };
-
-    // 4. values_len
-    let (&values_len, buf) = match ValuesLen::ref_from_prefix(buf) {
-        Ok(v) => v,
-        Err(ConvertError::Alignment(_)) => return PartialEntry::Invalid,
-        Err(ConvertError::Size(_)) => return PartialEntry::Key(key),
-    };
-
-    // 5. padding for values
-    let Some(buf) = advance_slice_to_align(size_of::<V>(), buf) else {
-        return PartialEntry::KeyAndValuesLen(key, values_len);
-    };
-
-    // 6. values
-    let (values, buf) = match <[V]>::ref_from_prefix_with_elems(buf, values_len as usize) {
-        Ok(v) => v,
-        Err(ConvertError::Alignment(_)) => return PartialEntry::Invalid,
-        Err(ConvertError::Size(_)) => return PartialEntry::KeyAndValuesLen(key, values_len),
-    };
-
-    PartialEntry::KeyAndValues(key, values, buf)
-}
-
-fn advance_slice_to_align(align: usize, data: &[u8]) -> Option<&[u8]> {
-    data.get(data.as_ptr().align_offset(align)..)
 }
